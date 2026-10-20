@@ -1167,11 +1167,11 @@ save_fig(power_fig(30), "figA3_power_n30", 7, 4.6)           # appendix A3
 save_fig(power_fig(120), "figA4_power_n120", 7, 4.6)         # appendix A4
 
 ## ---- 35. Figure 4: accuracy of expected-value trend estimators (n = 64) ----------------
-COL_E <- c("Two-part plug-in" = "#2a78d6", "Sen (full series)" = "#eb6834", "Akritas-Theil-Sen" = "#1baf7a",
-           "Mean pairwise slope" = "#eda100", "OLS" = "#e87ba4", "Hurdle plug-in" = "#008300", "Tobit plug-in" = "#6250d6")
+COL_E <- c("Two-part plug-in" = "#2a78d6", "Sen's slope" = "#eb6834", "ATS slope" = "#1baf7a",
+           "Mean pairwise slope" = "#eda100", "OLS slope" = "#e87ba4", "Hurdle plug-in" = "#008300", "Tobit plug-in" = "#6250d6")
 SHP_E <- setNames(unname(SHP_M), names(COL_E))
-elab <- c(TwoPart = "Two-part plug-in", Sen = "Sen (full series)", ATS = "Akritas-Theil-Sen",
-          MeanPairSlope = "Mean pairwise slope", OLS = "OLS", Hurdle = "Hurdle plug-in", Tobit = "Tobit plug-in")
+elab <- c(TwoPart = "Two-part plug-in", Sen = "Sen's slope", ATS = "ATS slope",
+          MeanPairSlope = "Mean pairwise slope", OLS = "OLS slope", Hurdle = "Hurdle plug-in", Tobit = "Tobit plug-in")
 be <- rd("step02_betaE_accuracy.csv")
 be <- be[be$n == 64 & be$scen %in% c("occ", "amt", "both"), ]   # opposite trends: true beta_E ~ 0 by design (see text)
 be$estimator <- factor(elab[be$estimator], levels = names(COL_E))
