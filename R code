@@ -1,148 +1,167 @@
 ############################################################################
-## paperZI - Two-part Mann-Kendall trend test for zero-inflated series
-## step01-10 (cumulative)
-##   step01: methods + baseline Monte Carlo (cached in step01_raw_v2.rds -> skipped)
-##   step02: competitors (Bonferroni, ZIQRank-type, hurdle, Tobit, ATS),
-##           stabilised expected-value trend (beta_E), heavy-tailed amounts (cached -> skipped)
-##   step03: real data - (A) USGS intermittent streamflow, (B) GHCN-Daily arid precipitation (cached -> fast)
-##   step04: serial dependence - Markov occurrence + AR(1) amounts (cached -> skipped)
-##   step05: real data re-tested with dependence-robust versions (block permutation, Hamed-Rao) + case series
-##   step06: manuscript figures (PDF + PNG 1600 dpi) in paperZI/figures
-##   v06b : precipitation months with total < 1 mm are treated as zero (trace / recording-practice
-##          changes otherwise create artificial occurrence trends); 0-mm threshold kept as sensitivity
-##   v06c : Figure 1 cases chosen by a fixed rule (2 strongest streamflow + strongest precipitation
-##          series with >= 55 complete years)
-##   v06d : Figure 1 y-axis on a pseudo-log scale (one extreme month no longer hides the rest)
-##   v06e : Figure 1 shows each series' own analysis window and shades years without a complete record
-##   step07: streamflow data audit (record gaps, zero-flow resolution) from cached files - no download
-##   step08: final numbers - strict Sen identity, 0 / 0.1 / 1 mm thresholds, dam-regulated gauges
-##           sensitivity, effect sizes with 95% intervals, manuscript Tables 1-3, final figure numbering
-##   step09: serial dependence repeated for n = 30 and n = 120 (reviewer check: calibration of
-##           block permutation across record lengths); checkpointed per cell, earlier steps skipped
-##   step10: Figure 1 streamflow in SI units (m3/s) as required by JSCS; nothing is recomputed
-## Author: Alper Umut Tosun (YTU Statistics) | seed 2026
+## Two-part Mann-Kendall trend test for zero-inflated series
+## Code for: A. U. Tosun and F. Karaman, "When Sen's slope is exactly zero:
+## Mann-Kendall trend inference for zero-inflated series and a two-part alternative".
+##
+## Run from the project folder (outputs go to ./paperZI). Simulations, downloads
+## and permutation runs are cached, so later runs only rebuild tables and figures.
+## Required packages: parallel, survival, ggplot2, scales, dataRetrieval.
+##
+## Step 00  numerical check of Theorem 1
+## Step 01  baseline simulation (Sen's slope, efficiency, exact and mid-p tests)
+## Step 02  comparison with six competing tests; beta_E estimators
+## Step 03  real data: USGS streamflow and GHCN-Daily precipitation
+## Step 04  serial dependence (n = 64): Hamed-Rao and block permutation
+## Step 05  dependence-robust tests for the real series
+## Step 06  figures (PDF, TIFF and PNG)
+## Step 07  streamflow data audit and sensitivity analyses
+## Step 08  effect sizes and Tables 1-3
+## Step 09  serial dependence at n = 30 and n = 120
+## Step 10  summary tables, site lists and monthly series
 ############################################################################
 
-rm(list = ls())                                              # clear workspace
+rm(list = ls())
 
-## ---- 0. Folders and packages ---------------------------------------------
-wd_main <- "C:/Users/Alper.Tosun/Desktop/cru130"             # main machine folder
-wd_alt  <- "C:/Users/autos/OneDrive/Desktop/cru130"          # fallback machine folder
-if (dir.exists(wd_main)) setwd(wd_main) else if (dir.exists(wd_alt)) setwd(wd_alt)  # pick the folder that exists
-out_dir <- file.path(getwd(), "paperZI")                     # subfolder for this paper's outputs
-dir.create(out_dir, showWarnings = FALSE)                    # create it if missing
-library(parallel)                                            # multi-core runs (base R)
-library(survival)                                            # Tobit via survreg (ships with R)
+## ---- Setup: folders and packages --------------------------------------------
+PROJECT_DIR <- getwd()                  # folder that holds (or will hold) paperZI/
+out_dir <- file.path(PROJECT_DIR, "paperZI")
+if (!dir.exists(out_dir) && interactive()) {
+  ans <- readline(paste0("No paperZI/ folder in ", PROJECT_DIR, ". All simulations and downloads will run ",
+                         "from scratch (many hours). Continue? [y/n] "))
+  if (tolower(ans) != "y") stop("Set the working directory to the project folder and run again.")
+}
+dir.create(out_dir, showWarnings = FALSE)
+library(parallel)
+library(survival)
 
-RUN_STEP01_SUMMARY <- FALSE                                  # step01 tables already written -> skip
-RUN_STEP02_SUMMARY <- FALSE                                  # step02 tables already written -> skip (set TRUE to rebuild)
+############################################################################
+## Step 00: numerical check of Theorem 1
+############################################################################
+set.seed(1)
+S_of <- function(x) { d <- outer(x, x, "-"); sum(sign(d[lower.tri(d)])) }
+sen_of <- function(y) { t <- seq_along(y); d <- outer(y, y, "-"); dt <- outer(t, t, "-")
+  median(d[lower.tri(d)] / dt[lower.tri(dt)]) }
+th1 <- t(replicate(5000, {
+  n <- sample(c(20, 21, 30, 31, 64), 1); p0 <- runif(1, 0.1, 0.9); b <- rnorm(1, 0, 2)
+  tc <- (1:n - (n + 1) / 2) / (n - 1)
+  y <- rbinom(n, 1, plogis(qlogis(1 - p0) + b * tc)) *
+       round(rgamma(n, 0.8, 0.08) * exp(rnorm(1) * tc), sample(c(1, 6), 1))  # rounding to 1 decimal creates ties
+  T <- sum(choose(table(y), 2)); S <- abs(S_of(y)); s0 <- sen_of(y) == 0
+  c(strict = s0 == (S < T), non_strict = s0 == (S <= T), S_equals_T = S == T)
+}))
+th1_tab <- data.frame(series = nrow(th1), t(round(colMeans(th1), 4)))
+write.csv(th1_tab, file.path(out_dir, "step00_theorem1_check.csv"), row.names = FALSE)
+print(th1_tab, row.names = FALSE)
 
-## ---- 1. Common settings ------------------------------------------------------
-set.seed(2026)                                               # global seed
-N_GRID  <- c(30, 64, 120)                                    # series lengths
-P0_GRID <- c(0.30, 0.50, 0.65, 0.80)                         # average share of exact zeros
-SCEN    <- c("H0", "occ", "amt", "both", "opp")              # trend scenarios
-B_OCC   <- 2.0                                               # total logit change of wet prob over record
-B_AMT   <- 1.5                                               # total log change of mean amount over record
-SHAPE   <- 0.8                                               # gamma shape (precip-like skew)
-SIG_LN  <- 1.5                                               # lognormal sigma (heavy tail, step02)
-MU0     <- 10                                                # mean wet amount at mid-record
-ALPHA   <- c(0.01, 0.05, 0.10)                               # test levels to report
+## ---- Simulation settings ----------------------------------------------------
+set.seed(2026)
+N_GRID  <- c(30, 64, 120)               # series lengths
+P0_GRID <- c(0.30, 0.50, 0.65, 0.80)    # average share of exact zeros
+SCEN    <- c("H0", "occ", "amt", "both", "opp")  # trend scenarios
+B_OCC   <- 2.0                          # total change in logit occurrence over the record
+B_AMT   <- 1.5                          # total change in log mean amount over the record
+SHAPE   <- 0.8                          # gamma shape of the positive values
+SIG_LN  <- 1.5                          # lognormal sigma
+MU0     <- 10                           # mean positive value at mid-record
+ALPHA   <- c(0.01, 0.05, 0.10)          # test levels to report
 
-scen_eff <- list(H0   = c(0, 0),                             # no trend
-                 occ  = c(B_OCC, 0),                         # more wet days only
-                 amt  = c(0, B_AMT),                         # larger wet amounts only
-                 both = c(B_OCC, B_AMT),                     # both increase
-                 opp  = c(-B_OCC, B_AMT))                    # fewer wet days, heavier amounts
+scen_eff <- list(H0   = c(0, 0),
+                 occ  = c(B_OCC, 0),
+                 amt  = c(0, B_AMT),
+                 both = c(B_OCC, B_AMT),
+                 opp  = c(-B_OCC, B_AMT))
 
-## ---- 2. Data generator ---------------------------------------------------
+############################################################################
+## Step 01: baseline simulation
+############################################################################
+## ---- Data generator ---------------------------------------------------------
 gen_series <- function(n, p0, b_occ, b_amt, dist = "gamma") {
-  t  <- 1:n                                                  # time index
-  tc <- (t - (n + 1) / 2) / (n - 1)                          # centred time in [-0.5, 0.5]
-  pw <- plogis(qlogis(1 - p0) + b_occ * tc)                  # wet probability at each t
-  mu <- MU0 * exp(b_amt * tc)                                # mean wet amount at each t
-  wet <- rbinom(n, 1, pw)                                    # wet/dry indicator
+  t  <- 1:n
+  tc <- (t - (n + 1) / 2) / (n - 1)
+  pw <- plogis(qlogis(1 - p0) + b_occ * tc)
+  mu <- MU0 * exp(b_amt * tc)
+  wet <- rbinom(n, 1, pw)
   amt <- if (dist == "gamma") {
-    rgamma(n, shape = SHAPE, rate = SHAPE / mu)              # gamma amount with mean mu
+    rgamma(n, shape = SHAPE, rate = SHAPE / mu)
   } else {
-    mu * exp(SIG_LN * rnorm(n) - SIG_LN^2 / 2)               # lognormal amount with mean mu
+    mu * exp(SIG_LN * rnorm(n) - SIG_LN^2 / 2)
   }
-  list(y = wet * amt, pw = pw, mu = mu)                      # y = 0 on dry steps
+  list(y = wet * amt, pw = pw, mu = mu)
 }
 
-## ---- 3. Exact null of Kendall S (no ties) --------------------------------
-kend_null <- function(nmax) {                                # pmf of inversions for m = 1..nmax
-  out <- vector("list", nmax); f <- 1                        # m = 1: 0 inversions
-  out[[1]] <- f                                              # store m = 1
-  for (k in 2:nmax) {                                        # add the k-th element
-    g  <- c(f, rep(0, k - 1))                                # pad for new support
-    cs <- cumsum(g)                                          # running sums
-    f  <- (cs - c(rep(0, k), cs[seq_len(length(g) - k)])) / k  # convolve with uniform{0..k-1}
-    out[[k]] <- f                                            # store pmf for m = k
+## ---- Exact null distributions -----------------------------------------------
+kend_null <- function(nmax) {
+  out <- vector("list", nmax); f <- 1
+  out[[1]] <- f
+  for (k in 2:nmax) {
+    g  <- c(f, rep(0, k - 1))
+    cs <- cumsum(g)
+    f  <- (cs - c(rep(0, k), cs[seq_len(length(g) - k)])) / k
+    out[[k]] <- f
   }
   out
 }
-KEND <- kend_null(max(N_GRID))                               # precompute once
+KEND <- kend_null(max(N_GRID))
 
-## ---- 4. Core functions (step01) ------------------------------------------
-S_stat <- function(x) {                                      # Kendall S against time order
-  d <- outer(x, x, "-")                                      # pairwise differences
-  sum(sign(d[lower.tri(d)]))                                 # sum sign(x_j - x_i), j > i
+## ---- MK, Sen's slope and the two-part test ----------------------------------
+S_stat <- function(x) {
+  d <- outer(x, x, "-")
+  sum(sign(d[lower.tri(d)]))
 }
 
-mk_asym <- function(x) {                                     # MK, tie-corrected normal approx
-  n <- length(x)                                             # sample size
-  if (n < 3) return(c(S = 0, z = 0, p = 1))                  # too short
-  S <- S_stat(x)                                             # trend statistic
-  tie <- rle(sort(x))$lengths                                # tied group sizes
-  v <- (n * (n - 1) * (2 * n + 5) - sum(tie * (tie - 1) * (2 * tie + 5))) / 18  # Var(S)
-  if (v <= 0) return(c(S = S, z = 0, p = 1))                 # constant series
-  z <- if (S > 0) (S - 1) / sqrt(v) else if (S < 0) (S + 1) / sqrt(v) else 0  # continuity-corrected z
-  c(S = S, z = z, p = 2 * pnorm(-abs(z)))                    # two-sided p
+mk_asym <- function(x) {
+  n <- length(x)
+  if (n < 3) return(c(S = 0, z = 0, p = 1))
+  S <- S_stat(x)
+  tie <- rle(sort(x))$lengths
+  v <- (n * (n - 1) * (2 * n + 5) - sum(tie * (tie - 1) * (2 * tie + 5))) / 18
+  if (v <= 0) return(c(S = S, z = 0, p = 1))
+  z <- if (S > 0) (S - 1) / sqrt(v) else if (S < 0) (S + 1) / sqrt(v) else 0
+  c(S = S, z = z, p = 2 * pnorm(-abs(z)))
 }
 
-p_amt_exact <- function(S, m) {                              # exact p for positives (no ties)
-  if (m < 2) return(c(p = 1, mid = 1))                       # nothing to test
-  k <- (m * (m - 1) / 2 - abs(S)) / 2                        # inversions at observed |S|
-  f <- KEND[[m]]                                             # exact pmf
-  lo <- sum(f[seq_len(k)]); eq <- f[k + 1]                   # P(inv < k), P(inv = k)
+p_amt_exact <- function(S, m) {
+  if (m < 2) return(c(p = 1, mid = 1))
+  k <- (m * (m - 1) / 2 - abs(S)) / 2
+  f <- KEND[[m]]
+  lo <- sum(f[seq_len(k)]); eq <- f[k + 1]
   c(p = min(1, 2 * (lo + eq)), mid = min(1, 2 * (lo + eq / 2)))  # conventional and mid-p
 }
 
-p_occ_exact <- function(S, n, m) {                           # exact p for wet/dry pattern
-  if (m == 0 || m == n) return(c(p = 1, mid = 1))            # no variation
-  U <- (S + m * (n - m)) / 2                                 # MK on 0/1 = Mann-Whitney U
-  u <- min(U, m * (n - m) - U)                               # lower-tail distance
-  lo <- if (u > 0) pwilcox(u - 1, m, n - m) else 0           # P(U < u)
-  eq <- dwilcox(u, m, n - m)                                 # P(U = u)
+p_occ_exact <- function(S, n, m) {
+  if (m == 0 || m == n) return(c(p = 1, mid = 1))
+  U <- (S + m * (n - m)) / 2
+  u <- min(U, m * (n - m) - U)
+  lo <- if (u > 0) pwilcox(u - 1, m, n - m) else 0
+  eq <- dwilcox(u, m, n - m)
   c(p = min(1, 2 * (lo + eq)), mid = min(1, 2 * (lo + eq / 2)))  # conventional and mid-p
 }
 
-sen_slope <- function(y, t) {                                # Theil-Sen slope
-  if (length(y) < 2) return(NA_real_)                        # need 2 points
-  d <- outer(y, y, "-"); dt <- outer(t, t, "-")              # pairwise differences
-  median(d[lower.tri(d)] / dt[lower.tri(dt)])                # median pairwise slope
+sen_slope <- function(y, t) {
+  if (length(y) < 2) return(NA_real_)
+  d <- outer(y, y, "-"); dt <- outer(t, t, "-")
+  median(d[lower.tri(d)] / dt[lower.tri(dt)])
 }
 
 p_fisher  <- function(p1, p2) pchisq(-2 * (log(max(p1, 1e-300)) + log(max(p2, 1e-300))),
-                                     df = 4, lower.tail = FALSE)          # Fisher, chi2(4)
-p_stouffer <- function(z1, z2) 2 * pnorm(-abs((z1 + z2) / sqrt(2)))      # same-direction test
-p_cauchy  <- function(p) {                                   # Cauchy combination of any p-vector
-  p <- pmin(pmax(p, 1e-15), 1 - 1e-15)                       # keep tan() finite
-  0.5 - atan(mean(tan((0.5 - p) * pi))) / pi                 # combined p
+                                     df = 4, lower.tail = FALSE)
+p_stouffer <- function(z1, z2) 2 * pnorm(-abs((z1 + z2) / sqrt(2)))
+p_cauchy  <- function(p) {
+  p <- pmin(pmax(p, 1e-15), 1 - 1e-15)
+  0.5 - atan(mean(tan((0.5 - p) * pi))) / pi
 }
 
-two_part <- function(y) {                                    # step01 statistics for one series
-  n <- length(y); t <- 1:n                                   # length and time
-  I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)  # occurrence, wet times, count
-  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])  # MK full, Part 1, Part 2
-  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)  # exact parts
-  b_occ <- NA_real_; dE <- NA_real_; b_amt <- NA_real_       # defaults
-  if (m >= 2) b_amt <- sen_slope(log(y[pos]), pos)           # Sen slope of log amount
-  if (m > 0 && m < n) {                                      # logistic needs both classes
+two_part <- function(y) {
+  n <- length(y); t <- 1:n
+  I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)
+  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])
+  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)
+  b_occ <- NA_real_; dE <- NA_real_; b_amt <- NA_real_
+  if (m >= 2) b_amt <- sen_slope(log(y[pos]), pos)
+  if (m > 0 && m < n) {
     fit <- suppressWarnings(glm.fit(cbind(1, t), I, family = binomial()))
-    a <- fit$coefficients[1]; b_occ <- fit$coefficients[2]  # logit intercept and slope
-    if (!is.na(b_amt)) {                                     # E[y] change (step01 version)
+    a <- fit$coefficients[1]; b_occ <- fit$coefficients[2]
+    if (!is.na(b_amt)) {
       c0 <- mean(y[pos] * exp(-b_amt * pos))
       Ey <- function(s) plogis(a + b_occ * s) * c0 * exp(b_amt * s)
       dE <- Ey(n) - Ey(1)
@@ -158,141 +177,163 @@ two_part <- function(y) {                                    # step01 statistics
     sen_full = sen_slope(y, t), b_occ = b_occ, b_amt = b_amt, dE = dE, n_wet = m)
 }
 
-## ---- 5. step01 simulation (skipped if cached) ----------------------------
-raw1_file <- file.path(out_dir, "step01_raw_v2.rds")         # step01 cache
-if (!file.exists(raw1_file)) {                               # only if missing
-  R_REPS <- 2000                                             # step01 replications
+## ---- Baseline simulation (cached) -------------------------------------------
+raw1_file <- file.path(out_dir, "step01_raw_v2.rds")
+if (!file.exists(raw1_file)) {
+  R_REPS <- 2000
   grid1 <- expand.grid(scen = SCEN, p0 = P0_GRID, n = N_GRID, stringsAsFactors = FALSE)
-  grid1$cell <- seq_len(nrow(grid1))                         # cell id
-  run_cell1 <- function(k, grid) {                           # one step01 cell
+  grid1$cell <- seq_len(nrow(grid1))
+  run_cell1 <- function(k, grid) {
     g <- grid[k, ]; set.seed(2026 + k); eff <- scen_eff[[g$scen]]
     cbind(cell = k, t(replicate(R_REPS, two_part(gen_series(g$n, g$p0, eff[1], eff[2])$y))))
   }
-  cl <- makeCluster(max(1, detectCores() - 1))               # workers
+  cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("gen_series", "S_stat", "mk_asym", "p_amt_exact", "p_occ_exact",
                       "sen_slope", "p_fisher", "p_stouffer", "p_cauchy", "two_part",
                       "scen_eff", "KEND", "R_REPS", "SHAPE", "MU0", "SIG_LN"))
   raw1 <- as.data.frame(do.call(rbind, parLapply(cl, grid1$cell, run_cell1, grid = grid1)))
-  stopCluster(cl)                                            # close workers
-  saveRDS(merge(grid1, raw1, by = "cell"), raw1_file)        # cache
-  RUN_STEP01_SUMMARY <- TRUE                                 # tables must be (re)made
+  stopCluster(cl)
+  saveRDS(merge(grid1, raw1, by = "cell"), raw1_file)
 }
-if (RUN_STEP01_SUMMARY) message("step01 raw re-created; rerun step01 v2 summary block if needed.")
-## (step01 tables: step01_rejection_rates.csv, step01_validity_H0.csv, step01_slope_accuracy.csv - done)
+raw1 <- readRDS(raw1_file)
+
+## ---- Baseline tables --------------------------------------------------------
+tests1 <- c(MK_full = "p_full", MK_occ = "p_occ", MK_occ_exact = "p_occ_ex",
+            MK_zeros_dropped = "p_amt", MK_amt_exact = "p_amt_ex",
+            TP_Fisher = "p_fisher", TP_Fisher_exact = "p_fisher_ex", TP_Fisher_mid = "p_fisher_mid")
+raw1$n0 <- raw1$n - raw1$n_wet
+raw1$sen0_pred <- abs(raw1$S_full) < choose(raw1$n0, 2)  # Theorem 1 (positive values are continuous)
+rej1 <- do.call(rbind, lapply(split(raw1, raw1$cell), function(d) {
+  r <- sapply(tests1, function(v) mean(d[[v]] < 0.05))
+  data.frame(scen = d$scen[1], p0 = d$p0[1], n = d$n[1], t(round(r, 3)),
+             Sen_zero_share = round(mean(d$sen_full == 0), 3),
+             Sen_zero_pred = round(mean(d$sen0_pred), 3),
+             identity_agree = round(mean((d$sen_full == 0) == d$sen0_pred), 4),
+             mean_n_wet = round(mean(d$n_wet), 1))
+}))
+rej1 <- rej1[order(match(rej1$scen, SCEN), rej1$n, rej1$p0), ]
+write.csv(rej1, file.path(out_dir, "step01_rejection_rates.csv"), row.names = FALSE)
+h01 <- raw1[raw1$scen == "H0", ]
+val1 <- do.call(rbind, lapply(split(h01, h01$cell), function(d) {
+  sz <- unlist(lapply(names(tests1), function(m)
+    setNames(sapply(ALPHA, function(a) mean(d[[tests1[m]]] < a)), paste0(m, "_", ALPHA * 100))))
+  data.frame(p0 = d$p0[1], n = d$n[1], t(round(sz, 3)),
+             spearman_p1_p2 = round(cor(d$p_occ_ex, d$p_amt_ex, method = "spearman"), 3))
+}))
+val1 <- val1[order(val1$n, val1$p0), ]
+write.csv(val1, file.path(out_dir, "step01_validity_H0.csv"), row.names = FALSE)
 
 ############################################################################
-## ===========================  STEP 02  ===================================
+## Step 02: comparison with competing tests
 ############################################################################
-R2 <- 1000                                                   # step02 replications per cell
-DIST <- c("gamma", "lognormal")                              # amount distributions
+R2 <- 1000                              # replications per cell
+DIST <- c("gamma", "lognormal")         # amount distributions
 
-## ---- 6. Extra tools for competitors ---------------------------------------
-firth_logit <- function(t, I, maxit = 50) {                  # Firth bias-reduced logistic (no separation blow-up)
-  X <- cbind(1, t - mean(t)); b <- c(0, 0)                   # centred design, start at 0
+## ---- Competing tests and estimators -----------------------------------------
+firth_logit <- function(t, I, maxit = 50) {
+  X <- cbind(1, t - mean(t)); b <- c(0, 0)
   for (i in 1:maxit) {
-    p <- plogis(drop(X %*% b)); w <- p * (1 - p)             # fitted probs and weights
-    Iinv <- solve(crossprod(X * sqrt(w)))                    # inverse Fisher information
-    h <- rowSums((X %*% Iinv) * X) * w                       # leverages
-    step <- Iinv %*% crossprod(X, I - p + h * (0.5 - p))     # modified score step
-    b <- b + drop(step)                                      # update
-    if (max(abs(step)) < 1e-8) break                         # converged
+    p <- plogis(drop(X %*% b)); w <- p * (1 - p)
+    Iinv <- solve(crossprod(X * sqrt(w)))
+    h <- rowSums((X %*% Iinv) * X) * w
+    step <- Iinv %*% crossprod(X, I - p + h * (0.5 - p))
+    b <- b + drop(step)
+    if (max(abs(step)) < 1e-8) break
   }
-  c(a = b[1] - b[2] * mean(t), b = b[2])                     # back to uncentred intercept
+  c(a = b[1] - b[2] * mean(t), b = b[2])
 }
 
-ols_slope <- function(y, t) sum((t - mean(t)) * (y - mean(y))) / sum((t - mean(t))^2)  # OLS slope
+ols_slope <- function(y, t) sum((t - mean(t)) * (y - mean(y))) / sum((t - mean(t))^2)
 
-mean_pair_slope <- function(y, t) {                          # mean of pairwise slopes (NAS 2020 workaround)
-  d <- outer(y, y, "-"); dt <- outer(t, t, "-")              # pairwise differences
-  mean(d[lower.tri(d)] / dt[lower.tri(dt)])                  # mean instead of median
+mean_pair_slope <- function(y, t) {
+  d <- outer(y, y, "-"); dt <- outer(t, t, "-")
+  mean(d[lower.tri(d)] / dt[lower.tri(dt)])
 }
 
-ats_slope <- function(y, t, iters = 30) {                    # Akritas-Theil-Sen slope, zeros treated as "<DL"
-  pos <- y > 0; if (sum(pos) < 2) return(NA_real_)           # need detected values
-  DL <- min(y[pos]) * (1 - 1e-9); cens <- !pos               # "<DL" just below the smallest positive
-  n <- length(y); pr <- which(lower.tri(matrix(0, n, n)), arr.ind = TRUE)  # all pairs (later i, earlier j)
-  I <- pr[, 1]; J <- pr[, 2]                                 # pair indices
-  ci <- cens[I]; cj <- cens[J]                               # censoring status in each pair
-  both <- ci & cj                                            # both censored: never decidable
-  S_of_b <- function(b) {                                    # Kendall S of censored residuals
-    v <- ifelse(cens, DL - b * t, y - b * t)                 # residual (upper bound if censored)
-    dv <- v[I] - v[J]                                        # later minus earlier
-    s <- sign(dv)                                            # default: both detected
-    s[both | (ci & !cj & dv > 0) | (!ci & cj & dv < 0)] <- 0 # undecidable comparisons
-    sum(s)                                                   # S(b)
+ats_slope <- function(y, t, iters = 30) {
+  pos <- y > 0; if (sum(pos) < 2) return(NA_real_)
+  DL <- min(y[pos]) * (1 - 1e-9); cens <- !pos
+  n <- length(y); pr <- which(lower.tri(matrix(0, n, n)), arr.ind = TRUE)
+  I <- pr[, 1]; J <- pr[, 2]
+  ci <- cens[I]; cj <- cens[J]
+  both <- ci & cj
+  S_of_b <- function(b) {
+    v <- ifelse(cens, DL - b * t, y - b * t)
+    dv <- v[I] - v[J]
+    s <- sign(dv)
+    s[both | (ci & !cj & dv > 0) | (!ci & cj & dv < 0)] <- 0
+    sum(s)
   }
-  B <- diff(range(y)) + 1e-6                                 # |slope| cannot exceed the data range
-  bisect <- function(low_side) {                             # bisection on non-increasing S(b)
+  B <- diff(range(y)) + 1e-6
+  bisect <- function(low_side) {
     lo <- -B; hi <- B
     for (k in 1:iters) {
-      mid <- (lo + hi) / 2; s <- S_of_b(mid)                 # evaluate S at midpoint
-      go_up <- if (low_side) s > 0 else s >= 0               # which half holds the boundary
-      if (go_up) lo <- mid else hi <- mid                    # shrink bracket
+      mid <- (lo + hi) / 2; s <- S_of_b(mid)
+      go_up <- if (low_side) s > 0 else s >= 0
+      if (go_up) lo <- mid else hi <- mid
     }
     (lo + hi) / 2
   }
-  (bisect(TRUE) + bisect(FALSE)) / 2                         # midpoint of the zero set of S(b)
+  (bisect(TRUE) + bisect(FALSE)) / 2
 }
 
-qr_rankscore_p <- function(y, x, taus = c(0.25, 0.5, 0.75)) {  # quantile rank-score test, Cauchy over taus
-  if (length(y) < 5) return(1)                               # too few positives
-  xc <- x - mean(x)                                          # centred covariate
+qr_rankscore_p <- function(y, x, taus = c(0.25, 0.5, 0.75)) {
+  if (length(y) < 5) return(1)
+  xc <- x - mean(x)
   p <- sapply(taus, function(tau) {
-    psi <- tau - (y < quantile(y, tau, type = 1))            # quantile score under H0
-    z <- sum(xc * psi) / sqrt(tau * (1 - tau) * sum(xc^2))   # standardised score
-    2 * pnorm(-abs(z))                                       # two-sided p
+    psi <- tau - (y < quantile(y, tau, type = 1))
+    z <- sum(xc * psi) / sqrt(tau * (1 - tau) * sum(xc^2))
+    2 * pnorm(-abs(z))
   })
-  p_cauchy(p)                                                # combine quantile levels
+  p_cauchy(p)
 }
 
-## ---- 7. All statistics for one series (step02) -----------------------------
+## ---- Statistics for one simulated series ------------------------------------
 comp_stats <- function(y) {
-  n <- length(y); t <- 1:n                                   # length and time
-  I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)  # occurrence, wet times, count
-  ## --- tests ---
-  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])  # MK full and parts
-  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)  # exact parts
-  p_tp  <- p_fisher(occE[["mid"]], amtE[["mid"]])           # proposed: Fisher of exact mid-p parts
-  p_bon <- min(1, 2 * min(occE[["p"]], amtE[["p"]]))         # two separate MK + Bonferroni
-  p_lr_occ <- 1; p_hurdle <- 1; p_ziq <- 1                    # defaults
-  g1 <- NULL; g2 <- NULL                                     # fitted GLMs (filled below)
-  if (m > 0 && m < n) {                                      # logistic part needs both classes
-    g1 <- suppressWarnings(glm.fit(cbind(1, t), I, family = binomial()))  # logit(p_t) = a + b t
-    lr1 <- max(0, g1$null.deviance - g1$deviance)            # LR statistic for occurrence slope
-    p_lr_occ <- pchisq(lr1, 1, lower.tail = FALSE)           # LR p-value
-    lr2 <- 0                                                 # amount part LR (gamma GLM)
+  n <- length(y); t <- 1:n
+  I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)
+  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])
+  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)
+  p_tp  <- p_fisher(occE[["mid"]], amtE[["mid"]])
+  p_bon <- min(1, 2 * min(occE[["p"]], amtE[["p"]]))
+  p_lr_occ <- 1; p_hurdle <- 1; p_ziq <- 1
+  g1 <- NULL; g2 <- NULL
+  if (m > 0 && m < n) {
+    g1 <- suppressWarnings(glm.fit(cbind(1, t), I, family = binomial()))
+    lr1 <- max(0, g1$null.deviance - g1$deviance)
+    p_lr_occ <- pchisq(lr1, 1, lower.tail = FALSE)
+    lr2 <- 0
     if (m >= 3) {
       g2 <- tryCatch(suppressWarnings(glm.fit(cbind(1, pos), y[pos],
-                     family = Gamma(link = "log"))), error = function(e) NULL)  # log mean = c + d t
+                     family = Gamma(link = "log"))), error = function(e) NULL)
       if (!is.null(g2) && g2$converged) {
-        phi <- sum((y[pos] - g2$fitted.values)^2 / g2$fitted.values^2) / (m - 2)  # Pearson dispersion
-        lr2 <- max(0, (g2$null.deviance - g2$deviance) / phi)  # scaled deviance drop
+        phi <- sum((y[pos] - g2$fitted.values)^2 / g2$fitted.values^2) / (m - 2)
+        lr2 <- max(0, (g2$null.deviance - g2$deviance) / phi)
       }
     }
-    p_hurdle <- pchisq(lr1 + lr2, 2, lower.tail = FALSE)     # hurdle joint test, chi2(2)
-    p_ziq <- p_fisher(p_lr_occ, qr_rankscore_p(y[pos], pos)) # ZIQRank-type: logistic + quantile rank-score
+    p_hurdle <- pchisq(lr1 + lr2, 2, lower.tail = FALSE)
+    p_ziq <- p_fisher(p_lr_occ, qr_rankscore_p(y[pos], pos))
   }
   tob <- tryCatch(survreg(Surv(y, y > 0, type = "left") ~ t, dist = "gaussian"),
-                  error = function(e) NULL)                  # Tobit (left-censored at 0)
+                  error = function(e) NULL)
   p_tobit <- if (is.null(tob)) NA_real_ else {
-    z <- unname(coef(tob)[2] / sqrt(vcov(tob)[2, 2])); 2 * pnorm(-abs(z)) }  # Wald p for slope
-  ## --- expected-value trend beta_E (OLS slope of E[y_t] on t) ---
-  bE_tp <- NA_real_; bE_hur <- NA_real_; bE_tob <- NA_real_  # defaults
+    z <- unname(coef(tob)[2] / sqrt(vcov(tob)[2, 2])); 2 * pnorm(-abs(z)) }
+  bE_tp <- NA_real_; bE_hur <- NA_real_; bE_tob <- NA_real_
   if (m >= 3 && m < n) {
-    fo <- firth_logit(t, I)                                  # Firth logistic for occurrence
-    ph <- plogis(fo[["a"]] + fo[["b"]] * t)                  # fitted wet probability
-    bs <- sen_slope(log(y[pos]), pos)                        # Sen slope of log amount
-    as <- median(log(y[pos]) - bs * pos)                     # median intercept
-    sm <- mean(exp(log(y[pos]) - as - bs * pos))             # smearing factor (median -> mean)
-    bE_tp <- ols_slope(ph * exp(as + bs * t) * sm, t)        # two-part plug-in beta_E
+    fo <- firth_logit(t, I)
+    ph <- plogis(fo[["a"]] + fo[["b"]] * t)
+    bs <- sen_slope(log(y[pos]), pos)
+    as <- median(log(y[pos]) - bs * pos)
+    sm <- mean(exp(log(y[pos]) - as - bs * pos))
+    bE_tp <- ols_slope(ph * exp(as + bs * t) * sm, t)
     if (!is.null(g2) && g2$converged) {
-      mh <- exp(g2$coefficients[1] + g2$coefficients[2] * t) # gamma-GLM mean curve
-      bE_hur <- ols_slope(plogis(g1$coefficients[1] + g1$coefficients[2] * t) * mh, t)  # hurdle plug-in
+      mh <- exp(g2$coefficients[1] + g2$coefficients[2] * t)
+      bE_hur <- ols_slope(plogis(g1$coefficients[1] + g1$coefficients[2] * t) * mh, t)
     }
   }
-  if (!is.null(tob)) {                                       # Tobit expected value curve
-    eta <- coef(tob)[1] + coef(tob)[2] * t; s <- tob$scale   # latent mean and sd
-    bE_tob <- ols_slope(pnorm(eta / s) * eta + s * dnorm(eta / s), t)  # E[max(0, latent)]
+  if (!is.null(tob)) {
+    eta <- coef(tob)[1] + coef(tob)[2] * t; s <- tob$scale
+    bE_tob <- ols_slope(pnorm(eta / s) * eta + s * dnorm(eta / s), t)
   }
   c(p_full = full[["p"]], p_zd = amt[["p"]], p_tp = p_tp, p_bon = p_bon,
     p_ziq = p_ziq, p_hurdle = p_hurdle, p_tobit = p_tobit,
@@ -301,249 +342,205 @@ comp_stats <- function(y) {
     bE_sen = sen_slope(y, t), bE_ats = ats_slope(y, t), n_wet = m)
 }
 
-## ---- 8. Run step02 cells ---------------------------------------------------
-cache2_dir <- file.path(out_dir, "cache_step02")            # per-cell checkpoint folder
-dir.create(cache2_dir, showWarnings = FALSE)                 # create if missing
+## ---- Comparison simulation (checkpointed per cell) --------------------------
+cache2_dir <- file.path(out_dir, "cache_step02")
+dir.create(cache2_dir, showWarnings = FALSE)
 
 run_cell2 <- function(k, grid, cache_dir) {
-  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))     # this cell's checkpoint file
-  if (file.exists(f)) return(readRDS(f))                     # already done -> reuse, no recomputation
-  g <- grid[k, ]; set.seed(3000 + k)                         # cell-specific seed
-  eff <- scen_eff[[g$scen]]                                  # trend effects
+  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))
+  if (file.exists(f)) return(readRDS(f))
+  g <- grid[k, ]; set.seed(3000 + k)
+  eff <- scen_eff[[g$scen]]
   res <- t(replicate(R2, comp_stats(gen_series(g$n, g$p0, eff[1], eff[2], g$dist)$y)))
-  res <- cbind(cell = k, res)                                # tag rows
-  saveRDS(res, f)                                            # save immediately (survives interruptions)
+  res <- cbind(cell = k, res)
+  saveRDS(res, f)
   res
 }
 
 grid2 <- expand.grid(scen = SCEN, p0 = P0_GRID, n = N_GRID, dist = DIST,
-                     stringsAsFactors = FALSE)               # 120 design cells
-grid2$cell <- seq_len(nrow(grid2))                           # cell id
+                     stringsAsFactors = FALSE)
+grid2$cell <- seq_len(nrow(grid2))
 
-raw2_file <- file.path(out_dir, "step02_raw.rds")            # step02 cache
+raw2_file <- file.path(out_dir, "step02_raw.rds")
 if (file.exists(raw2_file)) {
   raw2 <- readRDS(raw2_file); message("step02_raw.rds found - simulation skipped.")
 } else {
-  t0 <- Sys.time()                                           # timer
-  cl <- makeCluster(max(1, detectCores() - 1))               # workers
-  clusterEvalQ(cl, library(survival))                        # Tobit package on workers
+  t0 <- Sys.time()
+  cl <- makeCluster(max(1, detectCores() - 1))
+  clusterEvalQ(cl, library(survival))
   clusterExport(cl, c("gen_series", "S_stat", "mk_asym", "p_amt_exact", "p_occ_exact",
                       "sen_slope", "p_fisher", "p_cauchy", "firth_logit", "ols_slope",
                       "mean_pair_slope", "ats_slope", "qr_rankscore_p",
                       "comp_stats", "scen_eff", "KEND", "R2", "SHAPE", "MU0", "SIG_LN"))
-  todo <- sum(!file.exists(file.path(cache2_dir, sprintf("cell_%03d.rds", grid2$cell))))  # cells still missing
+  todo <- sum(!file.exists(file.path(cache2_dir, sprintf("cell_%03d.rds", grid2$cell))))
   message("step02: ", todo, " of ", nrow(grid2), " cells to compute (others reused from checkpoints).")
   raw2 <- as.data.frame(do.call(rbind, parLapply(cl, grid2$cell, run_cell2,
-                                                 grid = grid2, cache_dir = cache2_dir)))  # run or reuse each cell
-  stopCluster(cl)                                            # close workers
-  raw2 <- merge(grid2, raw2, by = "cell")                    # attach design
-  saveRDS(raw2, raw2_file)                                   # cache
-  RUN_STEP02_SUMMARY <- TRUE                                 # new results -> rebuild tables
+                                                 grid = grid2, cache_dir = cache2_dir)))
+  stopCluster(cl)
+  raw2 <- merge(grid2, raw2, by = "cell")
+  saveRDS(raw2, raw2_file)
   message("step02 run time: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
 }
 
-if (RUN_STEP02_SUMMARY) {                                     # step02 tables/figures (fast; off by default)
+## ---- Rejection rates --------------------------------------------------------
+tests2 <- c(MK_full = "p_full", MK_zeros_dropped = "p_zd", TwoPart_FisherMid = "p_tp",
+            TwoMK_Bonferroni = "p_bon", ZIQRank_type = "p_ziq",
+            Hurdle_LR = "p_hurdle", Tobit_Wald = "p_tobit")
 
-  ## ---- 9. Rejection rates ----------------------------------------------------
-  tests2 <- c(MK_full = "p_full", MK_zeros_dropped = "p_zd", TwoPart_FisherMid = "p_tp",
-              TwoMK_Bonferroni = "p_bon", ZIQRank_type = "p_ziq",
-              Hurdle_LR = "p_hurdle", Tobit_Wald = "p_tobit")  # label -> p column
+rej2 <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
+  r <- sapply(tests2, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))
+  data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], t(round(r, 3)),
+             tobit_fail = round(mean(is.na(d$p_tobit)), 3))
+}))
+rej2 <- rej2[order(rej2$dist, match(rej2$scen, SCEN), rej2$n, rej2$p0), ]
+write.csv(rej2, file.path(out_dir, "step02_rejection_rates.csv"), row.names = FALSE)
 
-  rej2 <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
-    r <- sapply(tests2, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))  # rejection at 5%
-    data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], t(round(r, 3)),
-               tobit_fail = round(mean(is.na(d$p_tobit)), 3))  # share of Tobit fits that failed
+## ---- Size at three levels ---------------------------------------------------
+h02 <- raw2[raw2$scen == "H0", ]
+size2 <- do.call(rbind, lapply(split(h02, h02$cell), function(d) {
+  sz <- unlist(lapply(names(tests2), function(m)
+    setNames(sapply(ALPHA, function(a) mean(d[[tests2[m]]] < a, na.rm = TRUE)),
+             paste0(m, "_", ALPHA * 100))))
+  data.frame(dist = d$dist[1], p0 = d$p0[1], n = d$n[1], t(round(sz, 3)))
+}))
+size2 <- size2[order(size2$dist, size2$n, size2$p0), ]
+write.csv(size2, file.path(out_dir, "step02_size_H0.csv"), row.names = FALSE)
+
+## ---- Accuracy of beta_E estimators ------------------------------------------
+true_bE <- function(n, p0, scen, dist) {
+  eff <- scen_eff[[scen]]; tc <- ((1:n) - (n + 1) / 2) / (n - 1)
+  E <- plogis(qlogis(1 - p0) + eff[1] * tc) * MU0 * exp(eff[2] * tc)
+  ols_slope(E, 1:n)
+}
+est_cols <- c(TwoPart = "bE_tp", Hurdle = "bE_hur", Tobit = "bE_tob", OLS = "bE_ols",
+              MeanPairSlope = "bE_mps", Sen = "bE_sen", ATS = "bE_ats")
+
+slp2 <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
+  tb <- true_bE(d$n[1], d$p0[1], d$scen[1], d$dist[1])
+  do.call(rbind, lapply(names(est_cols), function(m) {
+    e <- d[[est_cols[m]]]; ok <- is.finite(e); e <- e[ok]
+    data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], estimator = m,
+               true_bE = signif(tb, 4),
+               median_bias = signif(median(e) - tb, 4),
+               mean_bias = signif(mean(e) - tb, 4),
+               rmse = signif(sqrt(mean((e - tb)^2)), 4),
+               mad_err = signif(median(abs(e - tb)), 4),
+               share_zero = round(mean(e == 0), 3),
+               share_estimable = round(mean(ok), 3))
   }))
-  rej2 <- rej2[order(rej2$dist, match(rej2$scen, SCEN), rej2$n, rej2$p0), ]   # sort
-  write.csv(rej2, file.path(out_dir, "step02_rejection_rates.csv"), row.names = FALSE)
+}))
+slp2 <- slp2[order(slp2$dist, match(slp2$scen, SCEN), slp2$estimator, slp2$n, slp2$p0), ]
+write.csv(slp2, file.path(out_dir, "step02_betaE_accuracy.csv"), row.names = FALSE)
 
-  ## ---- 10. Size under H0 at three levels ----------------------------------------
-  h02 <- raw2[raw2$scen == "H0", ]                             # null cells
-  size2 <- do.call(rbind, lapply(split(h02, h02$cell), function(d) {
-    sz <- unlist(lapply(names(tests2), function(m)
-      setNames(sapply(ALPHA, function(a) mean(d[[tests2[m]]] < a, na.rm = TRUE)),
-               paste0(m, "_", ALPHA * 100))))                  # size at 1, 5, 10 %
-    data.frame(dist = d$dist[1], p0 = d$p0[1], n = d$n[1], t(round(sz, 3)))
-  }))
-  size2 <- size2[order(size2$dist, size2$n, size2$p0), ]       # sort
-  write.csv(size2, file.path(out_dir, "step02_size_H0.csv"), row.names = FALSE)
+## ---- Size-adjusted power ----------------------------------------------------
+## a test rejects when its p-value is at most the 5% quantile of its null p-values in the same cell
+h0_crit <- do.call(rbind, lapply(split(raw2[raw2$scen == "H0", ], ~ dist + n + p0, drop = TRUE), function(d)
+  data.frame(dist = d$dist[1], n = d$n[1], p0 = d$p0[1],
+             t(sapply(tests2, function(v) unname(quantile(d[[v]], 0.05, na.rm = TRUE, type = 1)))))))
+sap <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
+  cr <- h0_crit[h0_crit$dist == d$dist[1] & h0_crit$n == d$n[1] & h0_crit$p0 == d$p0[1], ]
+  r <- sapply(names(tests2), function(m) mean(d[[tests2[m]]] <= cr[[m]], na.rm = TRUE))
+  data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], t(round(r, 3)))
+}))
+sap <- sap[sap$scen != "H0", ]
+sap <- sap[order(sap$dist, match(sap$scen, SCEN), sap$n, sap$p0), ]
+write.csv(sap, file.path(out_dir, "step02_power_sizeadjusted.csv"), row.names = FALSE)
 
-  ## ---- 11. Expected-value trend accuracy (beta_E) --------------------------------
-  true_bE <- function(n, p0, scen, dist) {                     # OLS slope of true E[y_t] on t
-    eff <- scen_eff[[scen]]; tc <- ((1:n) - (n + 1) / 2) / (n - 1)
-    E <- plogis(qlogis(1 - p0) + eff[1] * tc) * MU0 * exp(eff[2] * tc)  # true E[y_t] (same for both dists)
-    ols_slope(E, 1:n)
-  }
-  est_cols <- c(TwoPart = "bE_tp", Hurdle = "bE_hur", Tobit = "bE_tob", OLS = "bE_ols",
-                MeanPairSlope = "bE_mps", Sen = "bE_sen", ATS = "bE_ats")  # label -> estimate column
-
-  slp2 <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
-    tb <- true_bE(d$n[1], d$p0[1], d$scen[1], d$dist[1])       # target
-    do.call(rbind, lapply(names(est_cols), function(m) {
-      e <- d[[est_cols[m]]]; ok <- is.finite(e); e <- e[ok]    # drop non-estimable reps
-      data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], estimator = m,
-                 true_bE = signif(tb, 4),
-                 median_bias = signif(median(e) - tb, 4),      # robust bias
-                 mean_bias = signif(mean(e) - tb, 4),          # classical bias
-                 rmse = signif(sqrt(mean((e - tb)^2)), 4),     # classical RMSE
-                 mad_err = signif(median(abs(e - tb)), 4),     # median absolute error (robust)
-                 share_zero = round(mean(e == 0), 3),          # share of estimates exactly 0
-                 share_estimable = round(mean(ok), 3))
-    }))
-  }))
-  slp2 <- slp2[order(slp2$dist, match(slp2$scen, SCEN), slp2$estimator, slp2$n, slp2$p0), ]  # sort
-  write.csv(slp2, file.path(out_dir, "step02_betaE_accuracy.csv"), row.names = FALSE)
-
-  ## ---- 12. Figures (optional, needs ggplot2) -----------------------------------
-  if (requireNamespace("ggplot2", quietly = TRUE)) {
-    library(ggplot2)                                           # plotting
-    for (dd in DIST) {                                         # one power figure per distribution
-      sub <- rej2[rej2$dist == dd, ]                           # rows for this distribution
-      long <- reshape(sub[, c("scen", "p0", "n", names(tests2))], direction = "long",
-                      varying = names(tests2), v.names = "rate", timevar = "method",
-                      times = names(tests2))                   # wide -> long
-      long$scen <- factor(long$scen, levels = SCEN)            # scenario order
-      pl <- ggplot(long, aes(p0, rate, colour = method)) +
-        geom_line() + geom_point(size = 1) +
-        geom_hline(yintercept = 0.05, linetype = 2) +          # nominal level
-        facet_grid(n ~ scen, labeller = label_both) +
-        labs(x = "Share of zeros", y = "Rejection rate (5%)", title = paste("Amounts:", dd)) +
-        theme_bw(base_size = 9)
-      ggsave(file.path(out_dir, paste0("step02_power_", dd, ".png")), pl, width = 11, height = 6, dpi = 200)
-    }
-    sl <- slp2[slp2$n == 64 & slp2$scen != "H0", ]             # beta_E errors at n = 64
-    sl$scen <- factor(sl$scen, levels = SCEN)                  # scenario order
-    pl2 <- ggplot(sl, aes(p0, mad_err, colour = estimator)) +  # robust error vs zero share
-      geom_line() + geom_point(size = 1) +
-      facet_grid(dist ~ scen, scales = "free_y") +
-      labs(x = "Share of zeros", y = "Median |error| of beta_E (n = 64)") +
-      theme_bw(base_size = 9)
-    ggsave(file.path(out_dir, "step02_betaE_error.png"), pl2, width = 11, height = 5, dpi = 200)
-  }
-
-  ## ---- 12b. Size-adjusted power (uses cached raw2, no new simulation) -------------
-  ## critical value = empirical 5% quantile of the method's p-values under H0 in the same (dist, n, p0) cell
-  h0_crit <- do.call(rbind, lapply(split(raw2[raw2$scen == "H0", ], ~ dist + n + p0, drop = TRUE), function(d)
-    data.frame(dist = d$dist[1], n = d$n[1], p0 = d$p0[1],
-               t(sapply(tests2, function(v) unname(quantile(d[[v]], 0.05, na.rm = TRUE, type = 1)))))))  # H0 5% quantiles
-  sap <- do.call(rbind, lapply(split(raw2, raw2$cell), function(d) {
-    cr <- h0_crit[h0_crit$dist == d$dist[1] & h0_crit$n == d$n[1] & h0_crit$p0 == d$p0[1], ]  # matching critical values
-    r <- sapply(names(tests2), function(m) mean(d[[tests2[m]]] <= cr[[m]], na.rm = TRUE))      # reject if p <= H0 quantile
-    data.frame(dist = d$dist[1], scen = d$scen[1], p0 = d$p0[1], n = d$n[1], t(round(r, 3)))
-  }))
-  sap <- sap[sap$scen != "H0", ]                               # power only (H0 is 0.05 by construction)
-  sap <- sap[order(sap$dist, match(sap$scen, SCEN), sap$n, sap$p0), ]  # sort
-  write.csv(sap, file.path(out_dir, "step02_power_sizeadjusted.csv"), row.names = FALSE)  # save table
-
-  ## worst-case relative power: each method vs the best method in the same cell (size-adjusted)
-  best <- apply(sap[, names(tests2)], 1, max)                  # best power in each cell
-  rel  <- sap[, names(tests2)] / ifelse(best > 0, best, NA)   # relative power (skip cells with no power)
-  worst <- aggregate(rel, by = list(dist = sap$dist), FUN = function(x) min(x, na.rm = TRUE))  # worst case over all cells
-  write.csv(cbind(worst[1], round(worst[-1], 3)),
-            file.path(out_dir, "step02_worstcase_relpower.csv"), row.names = FALSE)  # save table
-
-  ## ---- 13. Console summary --------------------------------------------------------
-  print(rej2[rej2$n == 64, c("dist", "scen", "p0", names(tests2))], row.names = FALSE)  # n = 64 view
-  message("Outputs written to: ", out_dir)                     # where files are
-
-}                                                            # end of step02 summary block
+## ---- Console summary --------------------------------------------------------
+print(rej2[rej2$n == 64, c("dist", "scen", "p0", names(tests2))], row.names = FALSE)
+message("Outputs written to: ", out_dir)
 
 ############################################################################
-## ===========================  STEP 03 (v2)  ==============================
-## Real data, two applications (all files downloaded ONCE by R and cached):
-##  A) USGS intermittent streamflow, southern US (AZ, NM, TX, OK) - main application
-##  B) GHCN-Daily precipitation, arid/semi-arid regions on several continents
-## Series = one calendar month across years (e.g. all Julys) -> zero-inflated
+## Step 03: real data (USGS streamflow, GHCN-Daily precipitation)
 ############################################################################
-options(timeout = 900)                                       # allow slow downloads (seconds)
-data_dir <- file.path(out_dir, "data_ghcn")                  # precipitation data folder
-flow_dir <- file.path(out_dir, "data_usgs")                  # streamflow data folder
+options(timeout = 900)
+data_dir <- file.path(out_dir, "data_ghcn")
+flow_dir <- file.path(out_dir, "data_usgs")
 dir.create(data_dir, showWarnings = FALSE); dir.create(flow_dir, showWarnings = FALSE)
-ZERO_RANGE <- c(0.15, 0.90)                                  # keep series with 15-90 % zero months
+ZERO_RANGE <- c(0.15, 0.90)             # keep series with 15-90 % zero months
 
-get_file <- function(url, dest) {                            # download only if not already on disk
-  if (file.exists(dest) && file.size(dest) > 0) return(TRUE) # already there -> no download
+get_file <- function(url, dest) {
+  if (file.exists(dest) && file.size(dest) > 0) return(TRUE)
   ok <- tryCatch({ download.file(url, dest, mode = "wb", quiet = TRUE); TRUE },
                  error = function(e) FALSE, warning = function(w) FALSE)
-  if (!ok && file.exists(dest)) file.remove(dest)            # remove broken partial file
+  if (!ok && file.exists(dest)) file.remove(dest)
   ok
 }
 
-days_in_month <- function(y, m) {                            # number of days in month m of year y
-  nxt <- as.Date(sprintf("%04d-%02d-01", y + (m == 12), m %% 12 + 1))  # first day of next month
-  as.integer(format(nxt - 1, "%d"))                          # last day of this month
+days_in_month <- function(y, m) {
+  nxt <- as.Date(sprintf("%04d-%02d-01", y + (m == 12), m %% 12 + 1))
+  as.integer(format(nxt - 1, "%d"))
 }
 
-## monthly table from a daily series; wet_fun() says which days count as "wet"/"flowing"
 monthly_from_daily <- function(id, year, month, v, wet_fun, stat = c("sum", "mean")) {
-  stat <- match.arg(stat)                                    # monthly total (rain) or mean (flow)
-  o <- order(year, month); year <- year[o]; month <- month[o]; v <- v[o]  # time order
-  key <- paste(year, month)                                  # one group per year-month
+  stat <- match.arg(stat)
+  o <- order(year, month); year <- year[o]; month <- month[o]; v <- v[o]
+  key <- paste(year, month)
   do.call(rbind, lapply(split(seq_along(v), key), function(ix) {
-    x <- v[ix]; yy <- year[ix[1]]; mm <- month[ix[1]]        # one month of days
-    nobs <- sum(!is.na(x)); wet <- !is.na(x) & wet_fun(x)    # valid and wet days
-    a <- x[-length(x)]; b <- x[-1]; ok <- !is.na(a) & !is.na(b)  # consecutive valid pairs
+    x <- v[ix]; yy <- year[ix[1]]; mm <- month[ix[1]]
+    nobs <- sum(!is.na(x)); wet <- !is.na(x) & wet_fun(x)
+    a <- x[-length(x)]; b <- x[-1]; ok <- !is.na(a) & !is.na(b)
     data.frame(id = id, year = yy, month = mm,
-               complete = nobs >= 0.9 * days_in_month(yy, mm),   # >= 90 % of days observed
+               complete = nobs >= 0.9 * days_in_month(yy, mm),
                value = if (stat == "sum") sum(x, na.rm = TRUE) else mean(x, na.rm = TRUE),
-               n_wet = sum(wet),                             # wet (or flowing) days
-               mean_wet = if (sum(wet) > 0) mean(x[wet]) else NA_real_,  # mean amount on wet days
+               n_wet = sum(wet),
+               mean_wet = if (sum(wet) > 0) mean(x[wet]) else NA_real_,
                n01 = sum(ok & !wet_fun(a) & wet_fun(b)), n00 = sum(ok & !wet_fun(a) & !wet_fun(b)),
                n11 = sum(ok & wet_fun(a) & wet_fun(b)),  n10 = sum(ok & wet_fun(a) & !wet_fun(b)))
   }))
 }
 
-## ---- 14. Statistics for one real series ------------------------------------------
-betaE_twopart <- function(y, t) {                            # two-part plug-in trend of E[y] per year
+## ---- Statistics for one real series -----------------------------------------
+betaE_twopart <- function(y, t) {
   I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)
-  if (m < 3 || m == length(y)) return(NA_real_)              # needs wet and dry years
-  fo <- firth_logit(t, I); ph <- plogis(fo[["a"]] + fo[["b"]] * t)  # occurrence curve
-  bs <- sen_slope(log(y[pos]), t[pos])                       # Sen slope of log amount
-  as <- median(log(y[pos]) - bs * t[pos])                    # median intercept
-  sm <- mean(exp(log(y[pos]) - as - bs * t[pos]))            # smearing (median -> mean)
-  ols_slope(ph * exp(as + bs * t) * sm, t)                   # slope of fitted E[y_t]
+  if (m < 3 || m == length(y)) return(NA_real_)
+  fo <- firth_logit(t, I); ph <- plogis(fo[["a"]] + fo[["b"]] * t)
+  bs <- sen_slope(log(y[pos]), t[pos])
+  as <- median(log(y[pos]) - bs * t[pos])
+  sm <- mean(exp(log(y[pos]) - as - bs * t[pos]))
+  ols_slope(ph * exp(as + bs * t) * sm, t)
 }
 
-real_stats <- function(y, t, nw, mw) {                       # y monthly value, t years, nw wet days, mw mean wet amount
+real_stats <- function(y, t, nw, mw) {
   n <- length(y); I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos); n0 <- n - m
-  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])     # MK full and parts
-  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)  # exact parts
-  ok <- !is.na(mw); mk_nw <- mk_asym(nw); mk_mw <- mk_asym(mw[ok])  # classical index approach
+  full <- mk_asym(y); occ <- mk_asym(I); amt <- mk_asym(y[pos])
+  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)
+  ok <- !is.na(mw); mk_nw <- mk_asym(nw); mk_mw <- mk_asym(mw[ok])
   yp <- y[pos]
   data.frame(n_years = n, zero_share = round(n0 / n, 3),
              p_MK_full = full[["p"]], S_full = full[["S"]],
              sen_slope = sen_slope(y, t), sen_zero = sen_slope(y, t) == 0,
-             identity_pred = abs(full[["S"]]) < choose(n0, 2),   # Theorem 1 with zeros only: Sen = 0 <=> |S| < C(n0, 2)
-             identity_pred_ties = abs(full[["S"]]) < sum(choose(table(y), 2)),  # Theorem 1 exact: |S| < number of tied pairs
+             identity_pred = abs(full[["S"]]) < choose(n0, 2),
+             identity_pred_ties = abs(full[["S"]]) < sum(choose(table(y), 2)),
              p_occ_exact = occE[["p"]], p_amt_exact = amtE[["p"]],
              dir_occ = sign(occ[["S"]]), dir_amt = sign(amt[["S"]]),
-             p_TwoPart = p_fisher(occE[["mid"]], amtE[["mid"]]),       # proposed test
-             p_TwoMK_Bonf = min(1, 2 * min(occE[["p"]], amtE[["p"]])), # separate MK + Bonferroni
-             p_Index_Bonf = min(1, 2 * min(mk_nw[["p"]], mk_mw[["p"]])),  # wet-day count & intensity MK + Bonferroni
+             p_TwoPart = p_fisher(occE[["mid"]], amtE[["mid"]]),
+             p_TwoMK_Bonf = min(1, 2 * min(occE[["p"]], amtE[["p"]])),
+             p_Index_Bonf = min(1, 2 * min(mk_nw[["p"]], mk_mw[["p"]])),
              p_nwet = mk_nw[["p"]], p_meanwet = mk_mw[["p"]],
-             betaE_TwoPart = betaE_twopart(y, t), betaE_OLS = ols_slope(y, t),  # units per year
+             betaE_TwoPart = betaE_twopart(y, t), betaE_OLS = ols_slope(y, t),
              mean_pos = mean(yp), cv_pos = sd(yp) / mean(yp),
-             gamma_shape = mean(yp)^2 / var(yp),             # method-of-moments gamma shape
-             ac1_occ = suppressWarnings(cor(I[-1], I[-n])),  # lag-1 autocorrelation of occurrence (years)
+             gamma_shape = mean(yp)^2 / var(yp),
+             ac1_occ = suppressWarnings(cor(I[-1], I[-n])),
              ac1_amt_rank = if (m >= 4) cor(rank(yp)[-1], rank(yp)[-m]) else NA)
 }
 
-run_series <- function(mon, min_years) {                     # apply real_stats to every id x calendar month
-  mon <- mon[mon$complete, ]                                 # complete months only
+run_series <- function(mon, min_years) {
+  mon <- mon[mon$complete, ]
   out <- lapply(split(mon, list(mon$id, mon$month), drop = TRUE), function(d) {
-    d <- d[order(d$year), ]                                  # time order
-    if (nrow(d) < min_years) return(NULL)                    # too short
-    z <- mean(d$value == 0)                                  # share of zero months
-    if (z < ZERO_RANGE[1] || z > ZERO_RANGE[2] || sum(d$value > 0) < 5) return(NULL)  # not zero-inflated enough
-    tr <- colSums(d[, c("n01", "n00", "n11", "n10")])        # daily transitions (all years)
+    d <- d[order(d$year), ]
+    if (nrow(d) < min_years) return(NULL)
+    z <- mean(d$value == 0)
+    if (z < ZERO_RANGE[1] || z > ZERO_RANGE[2] || sum(d$value > 0) < 5) return(NULL)
+    tr <- colSums(d[, c("n01", "n00", "n11", "n10")])
     cbind(data.frame(id = d$id[1], month = d$month[1]),
           real_stats(d$value, d$year, d$n_wet, d$mean_wet),
-          p01_daily = tr[["n01"]] / (tr[["n01"]] + tr[["n00"]]),  # P(wet | dry), daily
-          p11_daily = tr[["n11"]] / (tr[["n11"]] + tr[["n10"]]))  # P(wet | wet), daily
+          p01_daily = tr[["n01"]] / (tr[["n01"]] + tr[["n00"]]),
+          p11_daily = tr[["n11"]] / (tr[["n11"]] + tr[["n10"]]))
   })
   out <- do.call(rbind, out)
   if (!is.null(out)) {
-    out$q_TwoPart <- p.adjust(out$p_TwoPart, "BH")           # FDR within application
+    out$q_TwoPart <- p.adjust(out$p_TwoPart, "BH")
     out$q_MK_full <- p.adjust(out$p_MK_full, "BH")
     out$q_TwoMK_Bonf <- p.adjust(out$p_TwoMK_Bonf, "BH")
     out$q_Index_Bonf <- p.adjust(out$p_Index_Bonf, "BH")
@@ -551,60 +548,58 @@ run_series <- function(mon, min_years) {                     # apply real_stats 
   out
 }
 
-summarise_app <- function(r, label) {                        # one summary row per application
-  sig <- function(p) mean(p < 0.05, na.rm = TRUE)            # share significant at 5 %
-  nsig <- function(p) sum(p < 0.05, na.rm = TRUE)            # count significant at 5 %
+summarise_app <- function(r, label) {
+  sig <- function(p) mean(p < 0.05, na.rm = TRUE)
+  nsig <- function(p) sum(p < 0.05, na.rm = TRUE)
   data.frame(application = label, n_series = nrow(r), n_sites = length(unique(r$id)),
              median_zero_share = median(r$zero_share),
-             share_Sen_zero = mean(r$sen_zero, na.rm = TRUE),  # Sen slope exactly 0
-             identity_agreement = mean(r$sen_zero == r$identity_pred, na.rm = TRUE),            # zeros-only version
-             identity_agreement_ties = mean(r$sen_zero == r$identity_pred_ties, na.rm = TRUE),  # general version
+             share_Sen_zero = mean(r$sen_zero, na.rm = TRUE),
+             identity_agreement = mean(r$sen_zero == r$identity_pred, na.rm = TRUE),
+             identity_agreement_ties = mean(r$sen_zero == r$identity_pred_ties, na.rm = TRUE),
              sig_MK_full = sig(r$p_MK_full), sig_TwoPart = sig(r$p_TwoPart),
              sig_TwoMK_Bonf = sig(r$p_TwoMK_Bonf), sig_Index_Bonf = sig(r$p_Index_Bonf),
              sig_occ = sig(r$p_occ_exact), sig_amt = sig(r$p_amt_exact),
-             binom_p_TwoPart = binom.test(nsig(r$p_TwoPart), nrow(r), 0.05, "greater")$p.value,  # field significance (naive, independence)
+             binom_p_TwoPart = binom.test(nsig(r$p_TwoPart), nrow(r), 0.05, "greater")$p.value,
              binom_p_MK_full = binom.test(nsig(r$p_MK_full), nrow(r), 0.05, "greater")$p.value,
              fdr_TwoPart = mean(r$q_TwoPart < 0.05), fdr_MK_full = mean(r$q_MK_full < 0.05),
              fdr_TwoMK_Bonf = mean(r$q_TwoMK_Bonf < 0.05), fdr_Index_Bonf = mean(r$q_Index_Bonf < 0.05),
-             TwoPart_only = mean(r$p_TwoPart < 0.05 & r$p_MK_full >= 0.05),  # found only by two-part
-             MKfull_only = mean(r$p_MK_full < 0.05 & r$p_TwoPart >= 0.05),   # found only by MK_full
+             TwoPart_only = mean(r$p_TwoPart < 0.05 & r$p_MK_full >= 0.05),
+             MKfull_only = mean(r$p_MK_full < 0.05 & r$p_TwoPart >= 0.05),
              both_sig = mean(r$p_MK_full < 0.05 & r$p_TwoPart < 0.05),
              TwoPart_sig_given_Sen0 = if (any(r$sen_zero, na.rm = TRUE)) mean(r$p_TwoPart[which(r$sen_zero)] < 0.05) else NA,
              opposite_dir_share = mean(r$dir_occ * r$dir_amt < 0, na.rm = TRUE),
-             drying_share = mean(r$p_occ_exact < 0.05 & r$dir_occ < 0, na.rm = TRUE))  # significant fall in occurrence
+             drying_share = mean(r$p_occ_exact < 0.05 & r$dir_occ < 0, na.rm = TRUE))
 }
 
-calib_tab <- function(r, label) {                            # quantiles of real-data features (for step04)
+calib_tab <- function(r, label) {
   v <- c("zero_share", "gamma_shape", "cv_pos", "ac1_occ", "ac1_amt_rank", "p01_daily", "p11_daily")
   data.frame(application = label, stat = v,
              t(sapply(v, function(x) setNames(round(quantile(r[[x]], c(0.1, 0.25, 0.5, 0.75, 0.9), na.rm = TRUE), 3),
                                                c("q10", "q25", "q50", "q75", "q90")))))
 }
 
-############################################################################
-## A) USGS INTERMITTENT STREAMFLOW
-############################################################################
-if (!requireNamespace("dataRetrieval", quietly = TRUE)) install.packages("dataRetrieval")  # one-time install
-library(dataRetrieval)                                       # USGS official data package
-FLOW_STATES <- c(AZ = "Arizona", NM = "New Mexico", TX = "Texas", OK = "Oklahoma")  # southern drying region
-FLOW_YEARS  <- 1976:2025                                     # 50-year window
-FLOW_MIN_YEARS <- 35                                         # a series needs >= 35 complete years
-MAX_FLOW_SITES <- 220                                        # max gauges to download (seeded sample)
+## ---- Streamflow: settings ---------------------------------------------------
+if (!requireNamespace("dataRetrieval", quietly = TRUE)) install.packages("dataRetrieval")
+library(dataRetrieval)
+FLOW_STATES <- c(AZ = "Arizona", NM = "New Mexico", TX = "Texas", OK = "Oklahoma")  # study states
+FLOW_YEARS  <- 1976:2025                # 50-year window
+FLOW_MIN_YEARS <- 35                    # a series needs >= 35 complete years
+MAX_FLOW_SITES <- 220                   # max gauges to download (seeded sample)
 
-## ---- 15. Candidate gauges with long daily-discharge records (once) -------------
-cand_file <- file.path(flow_dir, "flow_candidates.csv")      # cached candidate list
+## ---- Candidate gauges -------------------------------------------------------
+cand_file <- file.path(flow_dir, "flow_candidates.csv")
 if (!file.exists(cand_file)) {
-  cand <- tryCatch({                                         # fast legacy inventory (1 request per state)
+  cand <- tryCatch({
     do.call(rbind, lapply(names(FLOW_STATES), function(st) {
       w <- whatNWISdata(stateCd = st, parameterCd = "00060", service = "dv", statCd = "00003")
       data.frame(site_no = w$site_no, name = w$station_nm, lat = w$dec_lat_va, lon = w$dec_long_va,
                  begin = as.Date(w$begin_date), end = as.Date(w$end_date), state = st)
     }))
   }, error = function(e) NULL)
-  if (is.null(cand)) {                                       # fallback: new USGS Water Data API
+  if (is.null(cand)) {
     cand <- do.call(rbind, lapply(names(FLOW_STATES), function(st) {
       ml <- read_waterdata_monitoring_location(state_name = FLOW_STATES[[st]], site_type = "Stream")
-      ml <- as.data.frame(ml); ml$geometry <- NULL           # drop map geometry
+      ml <- as.data.frame(ml); ml$geometry <- NULL
       ts <- as.data.frame(read_waterdata_ts_meta(monitoring_location_id = ml$monitoring_location_id,
                                                  parameter_code = "00060", statistic_id = "00003"))
       ts$geometry <- NULL
@@ -615,162 +610,160 @@ if (!file.exists(cand_file)) {
     }))
   }
   cand <- cand[cand$begin <= as.Date(sprintf("%d-01-01", min(FLOW_YEARS))) &
-               cand$end >= as.Date(sprintf("%d-12-31", max(FLOW_YEARS))), ]  # covers the whole window
-  cand <- cand[!duplicated(cand$site_no), ]                  # one row per gauge
-  set.seed(2026)                                             # reproducible sample
+               cand$end >= as.Date(sprintf("%d-12-31", max(FLOW_YEARS))), ]
+  cand <- cand[!duplicated(cand$site_no), ]
+  set.seed(2026)
   if (nrow(cand) > MAX_FLOW_SITES) cand <- cand[sort(sample(nrow(cand), MAX_FLOW_SITES)), ]
-  write.csv(cand, cand_file, row.names = FALSE)              # cache list
+  write.csv(cand, cand_file, row.names = FALSE)
 }
-cand <- read.csv(cand_file, colClasses = c(site_no = "character"))  # keep leading zeros
+cand <- read.csv(cand_file, colClasses = c(site_no = "character"))
 message("streamflow candidates: ", nrow(cand))
 
-## ---- 16. Download daily discharge once per gauge (resumable) ------------------------
-get_flow <- function(site_no) {                              # daily mean discharge (cfs) for one gauge
-  f <- file.path(flow_dir, paste0("dv_", site_no, ".rds"))   # per-gauge cache
-  if (file.exists(f)) return(readRDS(f))                     # already downloaded
-  d <- tryCatch({                                            # new API first
+## ---- Daily discharge (downloaded once per gauge) ----------------------------
+get_flow <- function(site_no) {
+  f <- file.path(flow_dir, paste0("dv_", site_no, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  d <- tryCatch({
     x <- read_waterdata_daily(monitoring_location_id = paste0("USGS-", site_no), parameter_code = "00060",
                               statistic_id = "00003",
                               time = c(sprintf("%d-01-01", min(FLOW_YEARS)), sprintf("%d-12-31", max(FLOW_YEARS))))
     x <- as.data.frame(x); data.frame(date = as.Date(x$time), q = as.numeric(x$value))
   }, error = function(e) NULL)
-  if (is.null(d) || nrow(d) == 0) d <- tryCatch({            # legacy service as fallback
+  if (is.null(d) || nrow(d) == 0) d <- tryCatch({
     x <- readNWISdv(site_no, "00060", sprintf("%d-01-01", min(FLOW_YEARS)), sprintf("%d-12-31", max(FLOW_YEARS)))
     data.frame(date = as.Date(x$Date), q = as.numeric(x[[grep("_00060_00003$", names(x))[1]]]))
   }, error = function(e) NULL)
-  if (is.null(d)) return(NULL)                               # failed (e.g. hourly request limit) -> retry next run
-  d <- d[!is.na(d$q) & d$q >= 0, ]                           # drop missing / invalid
-  d <- d[order(d$date), ]                                    # time order
-  saveRDS(d, f); d                                           # cache and return
+  if (is.null(d)) return(NULL)
+  d <- d[!is.na(d$q) & d$q >= 0, ]
+  d <- d[order(d$date), ]
+  saveRDS(d, f); d
 }
 
-flow_mon_file <- file.path(flow_dir, "flow_monthly.rds")     # monthly table cache
-n_fail <- 0                                                  # failed downloads in this run
+flow_mon_file <- file.path(flow_dir, "flow_monthly.rds")
+n_fail <- 0
 flow_mon <- do.call(rbind, lapply(cand$site_no, function(s) {
-  fm <- file.path(flow_dir, paste0("mon_", s, ".rds"))       # per-gauge monthly cache
-  if (file.exists(fm)) return(readRDS(fm))                   # already processed
+  fm <- file.path(flow_dir, paste0("mon_", s, ".rds"))
+  if (file.exists(fm)) return(readRDS(fm))
   d <- get_flow(s)
-  if (is.null(d)) { n_fail <<- n_fail + 1; return(NULL) }    # count failures, continue
+  if (is.null(d)) { n_fail <<- n_fail + 1; return(NULL) }
   m <- if (nrow(d) == 0) NULL else
     monthly_from_daily(s, as.integer(format(d$date, "%Y")), as.integer(format(d$date, "%m")), d$q,
-                       wet_fun = function(x) x > 0, stat = "mean")  # flowing day = discharge > 0
+                       wet_fun = function(x) x > 0, stat = "mean")
   saveRDS(m, fm); m
 }))
 if (n_fail > 0) message(n_fail, " gauges failed to download (likely USGS hourly request limit). ",
                         "Rerun the script later: finished gauges are kept, only missing ones are retried.")
-saveRDS(flow_mon, flow_mon_file)                             # cache full monthly table
+saveRDS(flow_mon, flow_mon_file)
 
-## ---- 17. Analyse streamflow series ------------------------------------------------
-resA <- if (is.null(flow_mon)) NULL else run_series(flow_mon, FLOW_MIN_YEARS)  # all gauge x month series
+## ---- Streamflow series ------------------------------------------------------
+resA <- if (is.null(flow_mon)) NULL else run_series(flow_mon, FLOW_MIN_YEARS)
 if (!is.null(resA)) {
-  resA <- merge(cand[, c("site_no", "name", "state")], resA, by.x = "site_no", by.y = "id")  # gauge info
+  resA <- merge(cand[, c("site_no", "name", "state")], resA, by.x = "site_no", by.y = "id")
   names(resA)[1] <- "id"
   write.csv(resA, file.path(out_dir, "step03_flow_series_results.csv"), row.names = FALSE)
 } else message("no usable streamflow series yet (downloads missing?) - rerun later.")
 
-############################################################################
-## B) GHCN-DAILY PRECIPITATION, ARID REGIONS (region boxes)
-############################################################################
-GHCN  <- "https://www.ncei.noaa.gov/pub/data/ghcn/daily/"    # NOAA GHCN-Daily public server
-YEARS <- 1961:2025                                           # analysis window
-MIN_YEARS <- 40                                              # a series needs >= 40 complete years
-MAX_PER_REGION <- 20                                         # stations per region (seeded sample)
-regions <- data.frame(                                       # lat/lon boxes of arid / semi-arid areas
+## ---- Precipitation: settings ------------------------------------------------
+GHCN  <- "https://www.ncei.noaa.gov/pub/data/ghcn/daily/"
+YEARS <- 1961:2025                      # analysis window
+MIN_YEARS <- 40                         # a series needs >= 40 complete years
+MAX_PER_REGION <- 20                    # stations per region (seeded sample)
+regions <- data.frame(
   region = c("US_Southwest", "Australia_interior", "Iberia", "Iran_MiddleEast",
              "North_Africa", "Southern_Africa", "Argentina_west"),
   lat1 = c(31, -32, 36, 25, 25, -32, -45), lat2 = c(37.5, -20, 42.5, 38, 37, -22, -27),
   lon1 = c(-117, 118, -7, 44, -10, 15, -70), lon2 = c(-103, 145, 0.5, 62, 12, 25, -64),
   stringsAsFactors = FALSE)
 
-## ---- 18. Station metadata (downloaded and parsed once) ------------------------------
-meta_rds <- file.path(data_dir, "ghcn_meta.rds")             # parsed metadata cache
+## ---- Station metadata (downloaded once) -------------------------------------
+meta_rds <- file.path(data_dir, "ghcn_meta.rds")
 if (!file.exists(meta_rds)) {
   st_file <- file.path(data_dir, "ghcnd-stations.txt"); inv_file <- file.path(data_dir, "ghcnd-inventory.txt")
   if (!get_file(paste0(GHCN, "ghcnd-stations.txt"), st_file) ||
       !get_file(paste0(GHCN, "ghcnd-inventory.txt"), inv_file))
     stop("GHCN metadata could not be downloaded - check internet/proxy and rerun.")
-  l  <- readLines(st_file)                                   # fixed-width station lines
+  l  <- readLines(st_file)
   st <- data.frame(id = substr(l, 1, 11), lat = as.numeric(substr(l, 13, 20)),
                    lon = as.numeric(substr(l, 22, 30)), elev = as.numeric(substr(l, 32, 37)),
                    name = trimws(substr(l, 42, 71)), stringsAsFactors = FALSE)
-  l  <- readLines(inv_file); l <- l[substr(l, 32, 35) == "PRCP"]  # precipitation inventory rows
+  l  <- readLines(inv_file); l <- l[substr(l, 32, 35) == "PRCP"]
   inv <- data.frame(id = substr(l, 1, 11), first = as.integer(substr(l, 37, 40)),
                     last = as.integer(substr(l, 42, 45)), stringsAsFactors = FALSE)
-  saveRDS(merge(st, inv, by = "id"), meta_rds)               # cache parsed metadata
+  saveRDS(merge(st, inv, by = "id"), meta_rds)
 }
 meta <- readRDS(meta_rds)
 
-sel_file <- file.path(out_dir, "step03_precip_stations.csv") # fixed station list (chosen once)
+sel_file <- file.path(out_dir, "step03_precip_stations.csv")
 if (!file.exists(sel_file)) {
-  cand_p <- meta[meta$first <= min(YEARS) & meta$last >= max(YEARS), ]  # long PRCP record
-  set.seed(2026)                                             # reproducible sampling
+  cand_p <- meta[meta$first <= min(YEARS) & meta$last >= max(YEARS), ]
+  set.seed(2026)
   selp <- do.call(rbind, lapply(seq_len(nrow(regions)), function(i) {
     g <- regions[i, ]
     x <- cand_p[cand_p$lat >= g$lat1 & cand_p$lat <= g$lat2 & cand_p$lon >= g$lon1 & cand_p$lon <= g$lon2, ]
     if (nrow(x) == 0) return(NULL)
-    if (nrow(x) > MAX_PER_REGION) x <- x[sort(sample(nrow(x), MAX_PER_REGION)), ]  # cap per region
+    if (nrow(x) > MAX_PER_REGION) x <- x[sort(sample(nrow(x), MAX_PER_REGION)), ]
     cbind(region = g$region, x)
   }))
-  write.csv(selp, sel_file, row.names = FALSE)               # save list so it never changes
+  write.csv(selp, sel_file, row.names = FALSE)
 }
 selp <- read.csv(sel_file, stringsAsFactors = FALSE)
-selp <- selp[!duplicated(selp$id), ]                         # FIX: a station inside two overlapping region boxes is kept once
+selp <- selp[!duplicated(selp$id), ]
 message("precipitation stations: ", nrow(selp))
 
-## ---- 19. Read .dly files (once per station, cached as monthly table) -------------------
-read_dly_prcp <- function(file) {                            # daily PRCP (mm) from a GHCN .dly file
-  l <- readLines(file); l <- l[substr(l, 18, 21) == "PRCP"]  # precipitation records only
+## ---- Monthly precipitation (downloaded once per station) --------------------
+read_dly_prcp <- function(file) {
+  l <- readLines(file); l <- l[substr(l, 18, 21) == "PRCP"]
   yr <- as.integer(substr(l, 12, 15)); mo <- as.integer(substr(l, 16, 17))
-  st <- 22 + 8 * (0:30)                                      # start column of each day's value
-  val <- matrix(sapply(st, function(s) as.numeric(substr(l, s, s + 4))), nrow = length(l))  # tenths of mm
-  qf  <- matrix(sapply(st, function(s) substr(l, s + 6, s + 6)), nrow = length(l))         # quality flag
-  val[val == -9999 | qf != " "] <- NA                        # missing or failed QC -> NA
+  st <- 22 + 8 * (0:30)
+  val <- matrix(sapply(st, function(s) as.numeric(substr(l, s, s + 4))), nrow = length(l))
+  qf  <- matrix(sapply(st, function(s) substr(l, s + 6, s + 6)), nrow = length(l))
+  val[val == -9999 | qf != " "] <- NA
   out <- data.frame(year = rep(yr, 31), month = rep(mo, 31), day = rep(1:31, each = length(l)),
-                    prcp = as.vector(val) / 10)              # mm
-  out[out$day <= days_in_month(out$year, out$month), ]       # keep real calendar days
+                    prcp = as.vector(val) / 10)
+  out[out$day <= days_in_month(out$year, out$month), ]
 }
 
 prcp_mon <- do.call(rbind, lapply(selp$id, function(id) {
-  fm <- file.path(data_dir, paste0("mon_", id, ".rds"))      # per-station monthly cache
+  fm <- file.path(data_dir, paste0("mon_", id, ".rds"))
   if (file.exists(fm)) return(readRDS(fm))
-  f <- file.path(data_dir, paste0(id, ".dly"))               # raw station file
+  f <- file.path(data_dir, paste0(id, ".dly"))
   if (!get_file(paste0(GHCN, "all/", id, ".dly"), f)) { message("download failed: ", id); return(NULL) }
-  d <- read_dly_prcp(f); d <- d[d$year %in% YEARS, ]         # window
+  d <- read_dly_prcp(f); d <- d[d$year %in% YEARS, ]
   m <- if (nrow(d) == 0) NULL else
-    monthly_from_daily(id, d$year, d$month, d$prcp, wet_fun = function(x) x >= 1, stat = "sum")  # ETCCDI wet day
+    monthly_from_daily(id, d$year, d$month, d$prcp, wet_fun = function(x) x >= 1, stat = "sum")
   saveRDS(m, fm); m
 }))
 
-PRCP_ZERO_MM <- 1                                            # month counts as "dry" if total < 1 mm
-prcp_mon_raw <- prcp_mon                                     # untouched monthly totals (sensitivity)
-prcp_mon$value[prcp_mon$value < PRCP_ZERO_MM] <- 0           # trace months -> exact zero (used everywhere below)
-resB_raw <- run_series(prcp_mon_raw, MIN_YEARS)              # sensitivity: 0-mm threshold
-prcp_mon_01 <- prcp_mon_raw; prcp_mon_01$value[prcp_mon_01$value < 0.1] <- 0   # 0.1-mm threshold
-resB_01 <- run_series(prcp_mon_01, MIN_YEARS)                # sensitivity: 0.1-mm threshold
-resB <- run_series(prcp_mon, MIN_YEARS)                      # main: 1-mm threshold, all station x month series
-resB <- merge(selp[, c("region", "id", "name", "lat", "lon")], resB, by = "id")  # station info
-annual <- aggregate(value ~ id + year, prcp_mon_raw[prcp_mon_raw$complete, ], sum)  # rough annual totals
+PRCP_ZERO_MM <- 1                       # month counts as "dry" if total < 1 mm
+prcp_mon_raw <- prcp_mon
+prcp_mon$value[prcp_mon$value < PRCP_ZERO_MM] <- 0  # months below 1 mm -> zero
+resB_raw <- run_series(prcp_mon_raw, MIN_YEARS)
+prcp_mon_01 <- prcp_mon_raw; prcp_mon_01$value[prcp_mon_01$value < 0.1] <- 0
+resB_01 <- run_series(prcp_mon_01, MIN_YEARS)
+resB <- run_series(prcp_mon, MIN_YEARS)
+resB <- merge(selp[, c("region", "id", "name", "lat", "lon")], resB, by = "id")
+annual <- aggregate(value ~ id + year, prcp_mon_raw[prcp_mon_raw$complete, ], sum)
 resB <- merge(resB, setNames(aggregate(value ~ id, annual, median), c("id", "median_annual_mm")), by = "id")
 write.csv(resB, file.path(out_dir, "step03_precip_series_results.csv"), row.names = FALSE)
 
-## ---- 20. Summaries -------------------------------------------------------------------
+## ---- Summaries --------------------------------------------------------------
 sumtab <- rbind(if (!is.null(resA)) summarise_app(resA, "USGS_streamflow"),
                 summarise_app(resB, "GHCN_precip_all"),
-                summarise_app(resB_raw, "GHCN_precip_all_threshold0mm"),   # sensitivity row
-                summarise_app(resB_01, "GHCN_precip_all_threshold0.1mm"),  # sensitivity row
+                summarise_app(resB_raw, "GHCN_precip_all_threshold0mm"),
+                summarise_app(resB_01, "GHCN_precip_all_threshold0.1mm"),
                 do.call(rbind, lapply(split(resB, resB$region), function(r)
-                  summarise_app(r, paste0("precip_", r$region[1])))))   # by region too
+                  summarise_app(r, paste0("precip_", r$region[1])))))
 num <- sapply(sumtab, is.numeric); sumtab[num] <- round(sumtab[num], 4)
 write.csv(sumtab, file.path(out_dir, "step03_summary.csv"), row.names = FALSE)
 
 write.csv(rbind(if (!is.null(resA)) calib_tab(resA, "USGS_streamflow"), calib_tab(resB, "GHCN_precip")),
-          file.path(out_dir, "step03_calibration.csv"), row.names = FALSE)  # inputs for step04
+          file.path(out_dir, "step03_calibration.csv"), row.names = FALSE)
 
 print(sumtab[, c("application", "n_series", "share_Sen_zero", "sig_MK_full", "sig_TwoPart",
                  "sig_TwoMK_Bonf", "sig_Index_Bonf", "TwoPart_only", "MKfull_only")], row.names = FALSE)
 message("step03 outputs written to: ", out_dir)
 
-## ---- 21. Case studies: trend found by two-part test while MK_full / Sen see nothing ----
+## ---- Case studies -----------------------------------------------------------
 cases <- rbind(
   if (!is.null(resA)) cbind(application = "USGS_streamflow",
         resA[, c("id", "name", "month", "n_years", "zero_share", "p_MK_full", "sen_slope",
@@ -778,116 +771,110 @@ cases <- rbind(
   cbind(application = "GHCN_precip",
         resB[, c("id", "name", "month", "n_years", "zero_share", "p_MK_full", "sen_slope",
                  "p_occ_exact", "dir_occ", "p_amt_exact", "dir_amt", "p_TwoPart", "betaE_TwoPart", "betaE_OLS")]))
-cases <- cases[cases$p_TwoPart < 0.05 & cases$p_MK_full >= 0.05, ]   # missed by MK_full
-cases <- cases[order(cases$p_TwoPart), ]                              # strongest first
+cases <- cases[cases$p_TwoPart < 0.05 & cases$p_MK_full >= 0.05, ]
+cases <- cases[order(cases$p_TwoPart), ]
 write.csv(cases, file.path(out_dir, "step03_case_studies.csv"), row.names = FALSE)
 
 ############################################################################
-## ===========================  STEP 04  ===================================
-## Serial dependence (calibrated to step03):
-##  occurrence = two-state Markov chain with lag-1 correlation rhoI (0, 0.2, 0.4)
-##  amounts    = gamma marginals driven by a Gaussian AR(1) copula, rhoA (0, 0.2, 0.3)
-##  shapes     = 0.8 (precipitation-like) and 0.25 (streamflow-like, very heavy tail)
-## Methods: naive tests, Hamed-Rao (1998) variance correction per part,
-##          circular moving-block permutation of the whole series (keeps both parts' dependence)
+## Step 04: serial dependence (n = 64)
 ############################################################################
-R4 <- 500                                                    # replications per cell
-B4 <- 199                                                    # block permutations per test
-N4 <- 64                                                     # series length (typical real record)
+R4 <- 500                               # replications per cell
+B4 <- 199                               # block permutations per test
+N4 <- 64                                # series length (typical real record)
 DEP <- data.frame(dep = c("none", "moderate", "strong"),
-                  rhoI = c(0, 0.2, 0.4), rhoA = c(0, 0.2, 0.3))  # dependence levels
-SHAPES4 <- c(0.8, 0.25)                                      # amount gamma shapes
-SCEN4 <- c("H0", "occ", "amt", "opp")                        # scenarios (step01 effect sizes)
-P04 <- c(0.3, 0.6)                                           # zero shares
+                  rhoI = c(0, 0.2, 0.4), rhoA = c(0, 0.2, 0.3))
+SHAPES4 <- c(0.8, 0.25)                 # amount gamma shapes
+SCEN4 <- c("H0", "occ", "amt", "opp")   # trend scenarios
+P04 <- c(0.3, 0.6)                      # zero shares
 
-## ---- 22. Dependent zero-inflated generator --------------------------------------
+## ---- Dependent zero-inflated generator --------------------------------------
 gen_dep <- function(n, p0, b_occ, b_amt, rhoI, rhoA, shape) {
-  tc <- ((1:n) - (n + 1) / 2) / (n - 1)                      # centred time
-  pw <- plogis(qlogis(1 - p0) + b_occ * tc)                  # target wet probability at t
-  mu <- MU0 * exp(b_amt * tc)                                # mean wet amount at t
-  wet <- numeric(n); wet[1] <- rbinom(1, 1, pw[1])           # first state
-  for (t in 2:n) {                                           # Markov transitions keep marginal ~ pw[t]
+  tc <- ((1:n) - (n + 1) / 2) / (n - 1)
+  pw <- plogis(qlogis(1 - p0) + b_occ * tc)
+  mu <- MU0 * exp(b_amt * tc)
+  wet <- numeric(n); wet[1] <- rbinom(1, 1, pw[1])
+  for (t in 2:n) {
     pr <- if (wet[t - 1] == 1) pw[t] + rhoI * (1 - pw[t]) else pw[t] * (1 - rhoI)
     wet[t] <- rbinom(1, 1, pr)
   }
-  z <- numeric(n); z[1] <- rnorm(1)                          # latent Gaussian AR(1)
+  z <- numeric(n); z[1] <- rnorm(1)
   for (t in 2:n) z[t] <- rhoA * z[t - 1] + sqrt(1 - rhoA^2) * rnorm(1)
-  amt <- qgamma(pnorm(z), shape = shape, rate = shape / mu)  # gamma marginal with mean mu
-  wet * amt                                                  # observed series
+  amt <- qgamma(pnorm(z), shape = shape, rate = shape / mu)
+  wet * amt
 }
 
-## ---- 23. Hamed-Rao modified MK p-value --------------------------------------------
-mk_hr <- function(x, t = seq_along(x)) {                     # Hamed & Rao (1998) variance correction
-  n <- length(x); a <- mk_asym(x)                            # naive tie-corrected MK
+## ---- Hamed-Rao corrected MK -------------------------------------------------
+mk_hr <- function(x, t = seq_along(x)) {
+  n <- length(x); a <- mk_asym(x)
   if (n < 6 || a[["z"]] == 0) return(c(z = a[["z"]], p = a[["p"]], f = 1))
-  b <- sen_slope(x, t); r <- x - b * t                       # remove Sen trend
-  R <- rank(r)                                               # ranks of residuals
-  rk <- acf(R, lag.max = n - 1, plot = FALSE)$acf[-1]        # rank autocorrelations
-  k <- seq_along(rk); sig <- abs(rk) > qnorm(0.975) / sqrt(n)  # keep significant lags only
-  f <- 1 + 2 / (n * (n - 1) * (n - 2)) * sum(((n - k) * (n - k - 1) * (n - k - 2) * rk)[sig])  # n/n*
-  f <- max(f, 1)                                             # never shrink the variance (conservative)
-  z <- a[["z"]] / sqrt(f)                                    # corrected z
+  b <- sen_slope(x, t); r <- x - b * t
+  R <- rank(r)
+  rk <- acf(R, lag.max = n - 1, plot = FALSE)$acf[-1]
+  k <- seq_along(rk); sig <- abs(rk) > qnorm(0.975) / sqrt(n)
+  f <- 1 + 2 / (n * (n - 1) * (n - 2)) * sum(((n - k) * (n - k - 1) * (n - k - 2) * rk)[sig])
+  f <- max(f, 1)
+  z <- a[["z"]] / sqrt(f)
   c(z = z, p = 2 * pnorm(-abs(z)), f = f)
 }
 
-## ---- 24. Block permutation p-values ------------------------------------------------
-fisher_stat <- function(y) {                                 # Fisher statistic from asymptotic parts (fast)
+## ---- Circular moving-block permutation --------------------------------------
+fisher_stat <- function(y) {
   I <- as.numeric(y > 0); pos <- which(y > 0)
   p1 <- mk_asym(I)[["p"]]; p2 <- mk_asym(y[pos])[["p"]]
   -2 * (log(max(p1, 1e-300)) + log(max(p2, 1e-300)))
 }
 block_perm_p <- function(y, B = B4, L = ceiling(1.5 * length(y)^(1/3))) {  # circular moving-block permutation
-  n <- length(y); nb <- ceiling(n / L)                       # number of blocks
-  T0 <- fisher_stat(y); S0 <- abs(S_stat(y))                 # observed two-part and MK_full statistics
+  n <- length(y); nb <- ceiling(n / L)
+  T0 <- fisher_stat(y); S0 <- abs(S_stat(y))
   Tb <- Sb <- numeric(B)
   for (b in 1:B) {
-    st <- sample.int(n, 1)                                   # random circular start
-    idx <- ((st - 1 + 0:(n - 1)) %% n) + 1                   # rotated index
-    blk <- split(idx, ceiling(seq_len(n) / L))               # consecutive blocks
-    yb <- y[unlist(blk[sample.int(nb)])][1:n]                # shuffled block order
+    st <- sample.int(n, 1)
+    idx <- ((st - 1 + 0:(n - 1)) %% n) + 1
+    blk <- split(idx, ceiling(seq_len(n) / L))
+    yb <- y[unlist(blk[sample.int(nb)])][1:n]
     Tb[b] <- fisher_stat(yb); Sb[b] <- abs(S_stat(yb))
   }
   c(p_tp_bp = (1 + sum(Tb >= T0)) / (B + 1), p_full_bp = (1 + sum(Sb >= S0)) / (B + 1))
 }
 
-## ---- 25. All step04 statistics for one series ----------------------------------------
+## ---- Statistics for one dependent series ------------------------------------
 dep_stats <- function(y) {
   n <- length(y); I <- as.numeric(y > 0); pos <- which(y > 0); m <- length(pos)
-  occ <- mk_asym(I); amt <- mk_asym(y[pos])                  # naive parts
-  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)  # exact parts
-  hO <- mk_hr(I); hA <- if (m >= 6) mk_hr(y[pos], pos) else c(z = 0, p = 1, f = 1)  # Hamed-Rao parts
-  bp <- block_perm_p(y)                                      # block permutation
+  occ <- mk_asym(I); amt <- mk_asym(y[pos])
+  occE <- p_occ_exact(occ[["S"]], n, m); amtE <- p_amt_exact(amt[["S"]], m)
+  hO <- mk_hr(I); hA <- if (m >= 6) mk_hr(y[pos], pos) else c(z = 0, p = 1, f = 1)
+  bp <- block_perm_p(y)
   c(p_full = mk_asym(y)[["p"]], p_full_hr = mk_hr(y)[["p"]], p_full_bp = bp[["p_full_bp"]],
-    p_tp = p_fisher(occE[["mid"]], amtE[["mid"]]),           # naive two-part (exact mid-p)
-    p_tp_hr = p_fisher(hO[["p"]], hA[["p"]]),                # Hamed-Rao two-part
-    p_bon_hr = min(1, 2 * min(hO[["p"]], hA[["p"]])),        # Hamed-Rao Bonferroni
-    p_tp_bp = bp[["p_tp_bp"]],                               # block-permutation two-part
-    f_occ = hO[["f"]], f_amt = hA[["f"]], n_wet = m)         # variance inflation factors
+    p_tp = p_fisher(occE[["mid"]], amtE[["mid"]]),
+    p_tp_hr = p_fisher(hO[["p"]], hA[["p"]]),
+    p_bon_hr = min(1, 2 * min(hO[["p"]], hA[["p"]])),
+    p_tp_bp = bp[["p_tp_bp"]],
+    f_occ = hO[["f"]], f_amt = hA[["f"]], n_wet = m)
 }
 
-## ---- 26. Run step04 cells (checkpointed per cell) ---------------------------------------
+## ---- Dependence simulation (checkpointed per cell) --------------------------
 grid4 <- expand.grid(scen = SCEN4, p0 = P04, dep = DEP$dep, shape = SHAPES4, stringsAsFactors = FALSE)
 grid4 <- merge(grid4, DEP, by = "dep"); grid4 <- grid4[order(grid4$shape, grid4$dep, grid4$scen, grid4$p0), ]
-grid4$cell <- seq_len(nrow(grid4))                           # 48 cells
+grid4$cell <- seq_len(nrow(grid4))
 cache4_dir <- file.path(out_dir, "cache_step04"); dir.create(cache4_dir, showWarnings = FALSE)
 
 run_cell4 <- function(k, grid, cache_dir) {
-  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))     # checkpoint file
-  if (file.exists(f)) return(readRDS(f))                     # already done
-  g <- grid[k, ]; set.seed(4000 + k)                         # cell-specific seed
-  eff <- scen_eff[[g$scen]]                                  # trend effects
+  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))
+  if (file.exists(f)) return(readRDS(f))
+  g <- grid[k, ]; set.seed(4000 + k)
+  eff <- scen_eff[[g$scen]]
   res <- t(replicate(R4, dep_stats(gen_dep(N4, g$p0, eff[1], eff[2], g$rhoI, g$rhoA, g$shape))))
   res <- cbind(cell = k, res); saveRDS(res, f); res
 }
 
-raw4_file <- file.path(out_dir, "step04_raw.rds")            # step04 cache
+raw4_file <- file.path(out_dir, "step04_raw.rds")
 if (file.exists(raw4_file)) {
   raw4 <- readRDS(raw4_file); message("step04_raw.rds found - simulation skipped.")
 } else {
   t0 <- Sys.time()
   todo <- sum(!file.exists(file.path(cache4_dir, sprintf("cell_%03d.rds", grid4$cell))))
   message("step04: ", todo, " of ", nrow(grid4), " cells to compute.")
-  cl <- makeCluster(max(1, detectCores() - 1))               # workers
+  cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("gen_dep", "S_stat", "mk_asym", "mk_hr", "sen_slope", "p_amt_exact", "p_occ_exact",
                       "p_fisher", "fisher_stat", "block_perm_p", "dep_stats", "scen_eff", "KEND",
                       "R4", "B4", "N4", "MU0"))
@@ -897,114 +884,111 @@ if (file.exists(raw4_file)) {
   message("step04 run time: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
 }
 
-## ---- 27. step04 tables ------------------------------------------------------------------
+## ---- Dependence tables ------------------------------------------------------
 tests4 <- c(MK_full = "p_full", MK_full_HR = "p_full_hr", MK_full_BlockPerm = "p_full_bp",
             TwoPart_naive = "p_tp", TwoPart_HR = "p_tp_hr", TwoMK_Bonf_HR = "p_bon_hr",
             TwoPart_BlockPerm = "p_tp_bp")
 rej4 <- do.call(rbind, lapply(split(raw4, raw4$cell), function(d) {
-  r <- sapply(tests4, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))  # rejection at 5 %
+  r <- sapply(tests4, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))
   data.frame(shape = d$shape[1], dep = d$dep[1], rhoI = d$rhoI[1], rhoA = d$rhoA[1],
              scen = d$scen[1], p0 = d$p0[1], t(round(r, 3)),
              mean_f_occ = round(mean(d$f_occ), 2), mean_f_amt = round(mean(d$f_amt), 2))
 }))
 rej4 <- rej4[order(rej4$shape, match(rej4$scen, SCEN4), rej4$rhoI, rej4$p0), ]
 write.csv(rej4, file.path(out_dir, "step04_rejection_rates.csv"), row.names = FALSE)
-print(rej4[rej4$scen == "H0", ], row.names = FALSE)          # size view
+print(rej4[rej4$scen == "H0", ], row.names = FALSE)
 message("step04 outputs written to: ", out_dir)
 
 ############################################################################
-## ===========================  STEP 05  ===================================
-## Real series re-tested with dependence-robust p-values (step04 showed naive
-## tests are liberal under serial dependence; block permutation keeps size).
+## Step 05: dependence-robust tests for the real series
 ############################################################################
-B5 <- 999                                                    # permutations per real series (p down to 0.001)
+B5 <- 999                               # permutations per real series
 
-robust_file <- file.path(out_dir, "step05t_real_robust.rds") # cache (computed once; v06b 1-mm threshold)
+robust_file <- file.path(out_dir, "step05t_real_robust.rds")
 if (file.exists(robust_file)) {
   rob <- readRDS(robust_file); message("step05t_real_robust.rds found - skipped.")
 } else {
   jobs <- rbind(if (!is.null(resA)) data.frame(application = "USGS_streamflow", id = resA$id, month = resA$month),
-                data.frame(application = "GHCN_precip", id = resB$id, month = resB$month))  # all real series
-  get_y <- function(app, id, month) {                        # rebuild the analysed series from cached monthly tables
+                data.frame(application = "GHCN_precip", id = resB$id, month = resB$month))
+  get_y <- function(app, id, month) {
     mon <- if (app == "USGS_streamflow") flow_mon else prcp_mon
     d <- mon[mon$id == id & mon$month == month & mon$complete, ]
     d <- d[order(d$year), ]; list(y = d$value, t = d$year)
   }
   series <- lapply(seq_len(nrow(jobs)), function(i) get_y(jobs$application[i], jobs$id[i], jobs$month[i]))
-  one <- function(i, series, B) {                            # robust p-values for one real series
-    set.seed(5000 + i)                                       # series-specific seed
+  one <- function(i, series, B) {
+    set.seed(5000 + i)
     y <- series[[i]]$y; t <- series[[i]]$t
     I <- as.numeric(y > 0); pos <- which(y > 0)
-    hO <- mk_hr(I, t); hA <- if (length(pos) >= 6) mk_hr(y[pos], t[pos]) else c(z = 0, p = 1, f = 1)  # Hamed-Rao parts
-    bp <- block_perm_p(y, B = B)                             # circular moving-block permutation
+    hO <- mk_hr(I, t); hA <- if (length(pos) >= 6) mk_hr(y[pos], t[pos]) else c(z = 0, p = 1, f = 1)
+    bp <- block_perm_p(y, B = B)
     c(p_full_hr = mk_hr(y, t)[["p"]], p_full_bp = bp[["p_full_bp"]],
       p_tp_hr = p_fisher(hO[["p"]], hA[["p"]]), p_tp_bp = bp[["p_tp_bp"]],
       f_occ = hO[["f"]], f_amt = hA[["f"]])
   }
-  cl <- makeCluster(max(1, detectCores() - 1))               # workers
+  cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("S_stat", "mk_asym", "mk_hr", "sen_slope", "p_fisher", "fisher_stat",
                       "block_perm_p", "one"))
   rob <- do.call(rbind, parLapply(cl, seq_along(series), function(i, series, B) one(i, series, B),
                                   series = series, B = B5))
   stopCluster(cl)
-  rob <- cbind(jobs, as.data.frame(rob)); saveRDS(rob, robust_file)  # cache
+  rob <- cbind(jobs, as.data.frame(rob)); saveRDS(rob, robust_file)
 }
 
-## ---- 27b. Two-stage refinement: series with p <= 0.01 get 19,999 permutations ------------
-## (with 999 permutations the smallest attainable p is 0.001, too coarse for BH-FDR over 200-300 series)
-B5b <- 19999                                                 # second-stage permutations (smallest p = 5e-5)
-refine_file <- file.path(out_dir, "step05t_refined.rds")     # cache (computed once; v06b)
-idx <- which(rob$p_tp_bp <= 0.01 | rob$p_full_bp <= 0.01)    # candidates for refinement
+## ---- Refinement: 19,999 permutations when p <= 0.01 -------------------------
+## 999 permutations give p >= 0.001, too coarse for BH-FDR over 200-300 series
+B5b <- 19999
+refine_file <- file.path(out_dir, "step05t_refined.rds")
+idx <- which(rob$p_tp_bp <= 0.01 | rob$p_full_bp <= 0.01)
 if (file.exists(refine_file)) {
   ref <- readRDS(refine_file); message("step05_refined.rds found - skipped.")
 } else {
-  get_y2 <- function(app, id, month) {                       # rebuild series from cached monthly tables
+  get_y2 <- function(app, id, month) {
     mon <- if (app == "USGS_streamflow") flow_mon else prcp_mon
     d <- mon[mon$id == id & mon$month == month & mon$complete, ]; d$value[order(d$year)]
   }
   ys <- lapply(idx, function(i) get_y2(rob$application[i], rob$id[i], rob$month[i]))
-  cl <- makeCluster(max(1, detectCores() - 1))               # workers
+  cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("S_stat", "mk_asym", "fisher_stat", "block_perm_p"))
   ref <- do.call(rbind, parLapply(cl, seq_along(idx), function(j, ys, idx, B) {
-    set.seed(6000 + idx[j]); block_perm_p(ys[[j]], B = B)    # series-specific seed
+    set.seed(6000 + idx[j]); block_perm_p(ys[[j]], B = B)
   }, ys = ys, idx = idx, B = B5b))
   stopCluster(cl)
   ref <- data.frame(row = idx, ref); saveRDS(ref, refine_file)
 }
-rob$refined <- FALSE                                         # flag refined rows
+rob$refined <- FALSE
 if (nrow(ref) > 0) {
   rob$p_tp_bp[ref$row] <- ref$p_tp_bp; rob$p_full_bp[ref$row] <- ref$p_full_bp; rob$refined[ref$row] <- TRUE
 }
 message("refined series: ", sum(rob$refined))
 
-## ---- 28. Merge with naive results and summarise ----------------------------------------
+## ---- Robust results and summary ---------------------------------------------
 naive <- rbind(if (!is.null(resA)) cbind(application = "USGS_streamflow", resA[, c("id", "month", "p_MK_full", "p_TwoPart", "p_Index_Bonf", "sen_zero")]),
                cbind(application = "GHCN_precip", resB[, c("id", "month", "p_MK_full", "p_TwoPart", "p_Index_Bonf", "sen_zero")]))
-real5 <- merge(naive, rob, by = c("application", "id", "month"))  # one row per real series
+real5 <- merge(naive, rob, by = c("application", "id", "month"))
 write.csv(real5, file.path(out_dir, "step05_real_robust_series.csv"), row.names = FALSE)
 
 sum5 <- do.call(rbind, lapply(split(real5, real5$application), function(r) {
-  q <- function(p) mean(p.adjust(p, "BH") < 0.05)            # FDR-significant share
-  s <- function(p) mean(p < 0.05)                            # raw 5 % share
+  q <- function(p) mean(p.adjust(p, "BH") < 0.05)
+  s <- function(p) mean(p < 0.05)
   data.frame(application = r$application[1], n_series = nrow(r),
              sig_MK_full_naive = s(r$p_MK_full), sig_TwoPart_naive = s(r$p_TwoPart),
              sig_MK_full_HR = s(r$p_full_hr), sig_TwoPart_HR = s(r$p_tp_hr),
              sig_MK_full_BP = s(r$p_full_bp), sig_TwoPart_BP = s(r$p_tp_bp),
              fdr_MK_full_BP = q(r$p_full_bp), fdr_TwoPart_BP = q(r$p_tp_bp),
-             TwoPart_BP_only = mean(r$p_tp_bp < 0.05 & r$p_full_bp >= 0.05),   # found only by robust two-part
+             TwoPart_BP_only = mean(r$p_tp_bp < 0.05 & r$p_full_bp >= 0.05),
              MKfull_BP_only = mean(r$p_full_bp < 0.05 & r$p_tp_bp >= 0.05),
              TwoPart_BP_sig_given_Sen0 = mean(r$p_tp_bp[which(r$sen_zero)] < 0.05),
-             median_f_occ = median(r$f_occ), share_f_occ_gt1 = mean(r$f_occ > 1),  # how often HR inflated variance
+             median_f_occ = median(r$f_occ), share_f_occ_gt1 = mean(r$f_occ > 1),
              fdr_MK_full_naive = q(r$p_MK_full), fdr_TwoPart_naive = q(r$p_TwoPart),
              n_refined = sum(r$refined), min_p_TwoPart_BP = min(r$p_tp_bp))
 }))
 num <- sapply(sum5, is.numeric); sum5[num] <- round(sum5[num], 4)
 write.csv(sum5, file.path(out_dir, "step05_summary.csv"), row.names = FALSE)
 
-## ---- 29. Export case-study series for manuscript figures -----------------------------------
-top <- rbind(head(cases[cases$application == "USGS_streamflow", ], 2),            # two strongest streamflow cases
-             head(cases[cases$application == "GHCN_precip" & cases$n_years >= 55, ], 1))  # strongest precipitation case
-                                                             # with >= 55 complete years (no long data gaps)
+## ---- Case-study series for Figure 1 -----------------------------------------
+top <- rbind(head(cases[cases$application == "USGS_streamflow", ], 2),  # two strongest streamflow cases
+             head(cases[cases$application == "GHCN_precip" & cases$n_years >= 55, ], 1))  # strongest precipitation case with >= 55 years
 case_series <- if (nrow(top) == 0) data.frame() else do.call(rbind, lapply(seq_len(nrow(top)), function(i) {
   mon <- if (top$application[i] == "USGS_streamflow") flow_mon else prcp_mon
   d <- mon[mon$id == top$id[i] & mon$month == top$month[i] & mon$complete, c("year", "value", "n_wet", "mean_wet")]
@@ -1016,29 +1000,26 @@ print(sum5, row.names = FALSE)
 message("step05 outputs written to: ", out_dir)
 
 ############################################################################
-## ===========================  STEP 06  ===================================
-## Manuscript figures -> paperZI/figures  (PDF vector + PNG 1600 dpi)
-## No titles inside figures (captions go in the manuscript); axes + legends kept.
-## Uses only saved tables / cached objects -> no simulation, no download.
+## Step 06: figures
 ############################################################################
-if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")  # one-time install
-library(ggplot2)                                             # plotting
-fig_dir <- file.path(out_dir, "figures")                     # figure folder
-unlink(list.files(fig_dir, pattern = "^fig.*\\.(pdf|png)$", full.names = TRUE))  # remove old figure files (re-made below)
-dir.create(fig_dir, showWarnings = FALSE)                    # create if missing
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+library(ggplot2)
+fig_dir <- file.path(out_dir, "figures")
+unlink(list.files(fig_dir, pattern = "^fig.*\\.(pdf|png|tif)$", full.names = TRUE))
+dir.create(fig_dir, showWarnings = FALSE)
 
-## ---- 30. Common style ---------------------------------------------------------
-INK <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"; GRID <- "#e1e0d9"  # text and chrome colours
-COL_M <- c("Two-part (proposed)" = "#2a78d6", "MK full series" = "#eb6834",  # one fixed colour per method,
-           "MK zeros dropped" = "#1baf7a", "Two MK + Bonferroni" = "#eda100",  # same in every figure
+## ---- Figure style -----------------------------------------------------------
+INK <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#898781"; GRID <- "#e1e0d9"
+COL_M <- c("Two-part (proposed)" = "#2a78d6", "MK full series" = "#eb6834",
+           "MK zeros dropped" = "#1baf7a", "Two MK + Bonferroni" = "#eda100",
            "ZIQRank-type" = "#e87ba4", "Hurdle LR" = "#008300", "Tobit Wald" = "#6250d6")
-SHP_M <- c("Two-part (proposed)" = 16, "MK full series" = 17, "MK zeros dropped" = 15,  # shapes = second cue
+SHP_M <- c("Two-part (proposed)" = 16, "MK full series" = 17, "MK zeros dropped" = 15,
            "Two MK + Bonferroni" = 18, "ZIQRank-type" = 4, "Hurdle LR" = 3, "Tobit Wald" = 8)
 SCEN_LAB <- c(H0 = "No trend", occ = "Occurrence trend", amt = "Amount trend",
-              both = "Same-direction trends", opp = "Opposite trends")   # panel labels
+              both = "Same-direction trends", opp = "Opposite trends")
 DIST_LAB <- c(gamma = "Gamma amounts", lognormal = "Lognormal amounts")
 
-theme_zi <- function() {                                     # clean journal theme
+theme_zi <- function() {
   theme_bw(base_size = 9) +
     theme(text = element_text(colour = INK), axis.text = element_text(colour = INK2),
           panel.grid.major = element_line(colour = GRID, linewidth = 0.25),
@@ -1047,64 +1028,72 @@ theme_zi <- function() {                                     # clean journal the
           strip.text = element_text(colour = INK, size = 8),
           legend.position = "bottom", legend.title = element_blank(),
           legend.key.width = unit(1.4, "lines"), legend.text = element_text(size = 8),
-          panel.spacing.x = unit(0.9, "lines"))                # room between panels for tick labels
+          panel.spacing.x = unit(0.9, "lines"))
 }
 
-save_fig <- function(p, name, w, h) {                        # PDF (vector) + PNG (1600 dpi)
+save_fig <- function(p, name, w, h) {
   ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, units = "in", device = cairo_pdf)
-  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 1600)
+  ggsave(file.path(fig_dir, paste0(name, ".tif")), p, width = w, height = h, units = "in", dpi = 600,
+         device = "tiff", compression = "lzw")
+  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 600)
   message("saved: ", name)
 }
-rd <- function(f) read.csv(file.path(out_dir, f), stringsAsFactors = FALSE)  # read a saved table
+rd <- function(f) read.csv(file.path(out_dir, f), stringsAsFactors = FALSE)
 
-## ---- 31. Figure 1: real series where MK / Sen see nothing ------------------------
-cs <- if (exists("case_series")) case_series else data.frame()   # case series built in step05
+## ---- Figure 1: series in which MK and Sen's slope miss a trend --------------
+cs <- if (exists("case_series")) case_series else data.frame()
 if (nrow(cs) == 0) message("Figure 1 skipped: no case-study series available.") else {
-cs$key <- paste(cs$id, cs$month)                             # one panel per station-month
+cs$key <- paste(cs$id, cs$month)
 keys <- unique(cs$key)
-keep <- keys[!duplicated(sub(" .*", "", keys))][1:3]         # first three distinct stations
+keep <- keys[!duplicated(sub(" .*", "", keys))][1:3]
 cs <- cs[cs$key %in% keep, ]
 cinfo <- if (exists("cases")) cases else rd("step03_case_studies.csv")
 cinfo$key <- paste(cinfo$id, cinfo$month)
 cinfo <- cinfo[match(keep, cinfo$key), ]
 fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", paste("=", formatC(p, format = "f", digits = 3)))
-CFS2CMS <- 0.0283168                                         # 1 cubic foot per second = 0.0283168 m3/s (SI units)
-flow_case <- cinfo$application == "USGS_streamflow"         # which panels are streamflow
-unit_lab <- ifelse(flow_case, "mean flow, m\u00b3 s\u207b\u00b9", "total, mm")  # SI unit labels
-cinfo$sen_si <- cinfo$sen_slope * ifelse(flow_case, CFS2CMS, 1)   # Sen slope in the same units as the plot
-cinfo$panel <- paste0(LETTERS[1:3], ". ", tools::toTitleCase(tolower(sub(",.*| \\(.*", "", cinfo$name))), ", ",
-                      month.name[cinfo$month], " (", unit_lab, ")")      # panel label
+CFS2CMS <- 0.0283168                    # 1 ft3/s = 0.0283168 m3/s
+flow_case <- cinfo$application == "USGS_streamflow"
+unit_lab <- ifelse(flow_case, "mean flow, m\u00b3 s\u207b\u00b9", "total, mm")
+cinfo$sen_si <- cinfo$sen_slope * ifelse(flow_case, CFS2CMS, 1)
+nice_name <- function(x) {
+  x <- tools::toTitleCase(tolower(sub(",.*| \\(.*", "", x)))
+  x <- gsub("\\bCk\\b", "Creek", x)
+  x <- gsub("\\b(Nr|Near)\\b", "near", x)
+  x
+}
+cinfo$panel <- paste0(LETTERS[1:3], ". ", nice_name(cinfo$name), ", ",
+                      month.name[cinfo$month], " (", unit_lab, ")")
 cinfo$note <- paste0("MK p ", fmt_p(cinfo$p_MK_full), ";  Sen slope = ", sapply(signif(cinfo$sen_si, 2), format, scientific = FALSE),
                      "\nTwo-part p ", fmt_p(cinfo$p_TwoPart), "  (occurrence ",
                      ifelse(cinfo$dir_occ > 0, "increasing", "decreasing"), ", amount ",
-                     ifelse(cinfo$dir_amt > 0, "increasing", "decreasing"), ")")  # in-panel annotation
+                     ifelse(cinfo$dir_amt > 0, "increasing", "decreasing"), ")")
 cs$panel <- factor(cinfo$panel[match(cs$key, cinfo$key)], levels = cinfo$panel)
 cs$type <- ifelse(cs$value > 0, "Positive value", "Exact zero")
-is_flow <- cs$application == "USGS_streamflow"              # streamflow rows of the case series
-cs$value[is_flow] <- cs$value[is_flow] * CFS2CMS             # cfs -> m3/s (zeros stay zero)
-win <- lapply(cinfo$application, function(a) if (a == "USGS_streamflow") FLOW_YEARS else YEARS)  # analysis window per panel
+is_flow <- cs$application == "USGS_streamflow"
+cs$value[is_flow] <- cs$value[is_flow] * CFS2CMS
+win <- lapply(cinfo$application, function(a) if (a == "USGS_streamflow") FLOW_YEARS else YEARS)
 ann <- data.frame(panel = factor(cinfo$panel, levels = cinfo$panel), note = cinfo$note,
-                  x = sapply(win, min) - 0.5,                # left edge of each panel's own window
+                  x = sapply(win, min) - 0.5,
                   y = tapply(cs$value, cs$panel, max)[cinfo$panel])
-gaps <- do.call(rbind, lapply(seq_along(win), function(i) {  # runs of years without a complete record
+gaps <- do.call(rbind, lapply(seq_along(win), function(i) {
   miss <- setdiff(win[[i]], cs$year[cs$panel == cinfo$panel[i]])
   if (length(miss) == 0) return(NULL)
-  grp <- cumsum(c(1, diff(miss) != 1))                       # consecutive years -> one run
+  grp <- cumsum(c(1, diff(miss) != 1))
   data.frame(panel = factor(cinfo$panel[i], levels = cinfo$panel),
              xmin = tapply(miss, grp, min) - 0.5, xmax = tapply(miss, grp, max) + 0.5,
              what = "No complete record")
 }))
 edges <- data.frame(panel = factor(cinfo$panel, levels = cinfo$panel),
-                    x = c(sapply(win, min) - 0.5, sapply(win, max) + 0.5))  # x-range = analysis window
-plog <- scales::pseudo_log_trans(sigma = 0.001, base = 10)  # log-like above 0.001, linear near 0, keeps zeros (m3/s values are small)
-ann$y_note <- plog$inverse(plog$transform(ann$y) * 1.30)     # note position above the data (in plotted units)
-ann$y_top  <- plog$inverse(plog$transform(ann$y) * 1.34)     # head-room
+                    x = c(sapply(win, min) - 0.5, sapply(win, max) + 0.5))
+plog <- scales::pseudo_log_trans(sigma = 0.001, base = 10)
+ann$y_note <- plog$inverse(plog$transform(ann$y) * 1.30)
+ann$y_top  <- plog$inverse(plog$transform(ann$y) * 1.34)
 f1 <- ggplot(cs, aes(year, value)) +
   {if (!is.null(gaps)) geom_rect(data = gaps, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = what),
-                                 inherit.aes = FALSE)} +       # shaded years without data
+                                 inherit.aes = FALSE)} +
   scale_fill_manual(values = c("No complete record" = "#f0efec")) +
-  geom_blank(data = edges, aes(x = x), inherit.aes = FALSE) +  # force each panel's own window
-  geom_segment(aes(xend = year, yend = 0), colour = GRID, linewidth = 0.3) +   # stems to the baseline
+  geom_blank(data = edges, aes(x = x), inherit.aes = FALSE) +
+  geom_segment(aes(xend = year, yend = 0), colour = GRID, linewidth = 0.3) +
   geom_point(aes(shape = type, colour = type), size = 1.6) +
   scale_shape_manual(values = c("Exact zero" = 1, "Positive value" = 16)) +
   scale_colour_manual(values = c("Exact zero" = MUTED, "Positive value" = "#2a78d6")) +
@@ -1114,35 +1103,36 @@ f1 <- ggplot(cs, aes(year, value)) +
   scale_y_continuous(trans = plog, breaks = c(0, 0.01, 0.1, 1, 10, 100, 1000),
                      labels = c("0", "0.01", "0.1", "1", "10", "100", "1000"),
                      expand = expansion(mult = c(0.02, 0.05))) +
-  geom_blank(data = ann, aes(x = x, y = y_top)) +             # head-room so the note sits above the data
+  geom_blank(data = ann, aes(x = x, y = y_top)) +
   scale_x_continuous(expand = expansion(add = 0.5)) +
   guides(fill = guide_legend(override.aes = list(colour = "#c3c2b7"))) +
   labs(x = "Year", y = "Monthly value (pseudo-log scale)") + theme_zi()
-save_fig(f1, "fig1_case_series", 7, 6.5)                    # main text
-}                                                            # end of Figure 1
+save_fig(f1, "fig1_case_series", 7, 6.5)
+}
 
-## ---- 32. Figure 2: collapse of Sen's slope ---------------------------------------------
+## ---- Figure 2: share of zero Sen slopes -------------------------------------
 r1 <- rd("step01_rejection_rates.csv")
 r1$scen <- factor(SCEN_LAB[r1$scen], levels = SCEN_LAB); r1$n <- factor(paste("n =", r1$n), levels = paste("n =", c(30, 64, 120)))
 f2 <- ggplot(r1, aes(p0, Sen_zero_share, colour = n, shape = n)) +
   geom_line(linewidth = 0.6) + geom_point(size = 1.8) +
-  scale_colour_manual(values = c("#86b6ef", "#2a78d6", "#104281")) +   # ordinal blue ramp (short -> long)
+  scale_colour_manual(values = c("#86b6ef", "#2a78d6", "#104281")) +
+  scale_shape_manual(values = c(1, 17, 15)) +
   facet_wrap(~ scen, nrow = 1) +
   scale_x_continuous(breaks = c(0.3, 0.5, 0.65, 0.8), labels = c("0.3", "0.5", "0.65", "0.8")) + scale_y_continuous(limits = c(0, 1)) +
   labs(x = "Share of zeros", y = "Share of samples with Sen slope = 0") + theme_zi()
-save_fig(f2, "fig2_sen_collapse", 7, 2.9)                   # main text
+save_fig(f2, "fig2_sen_collapse", 7, 2.9)
 
-## ---- 33. Figure A1: efficiency of MK on the full series ---------------------------------
+## ---- Figure A1: efficiency of MK on the full series -------------------------
 pz <- seq(0, 0.95, by = 0.01)
 th <- rbind(data.frame(p0 = pz, ARE = (1 - pz)^3 / (1 - pz^3), alt = "Amount trend (vs. Part 2)"),
             data.frame(p0 = pz[pz > 0], ARE = 3 * pz[pz > 0] * (1 - pz[pz > 0]) / (1 - pz[pz > 0]^3),
-                       alt = "Occurrence trend (vs. Part 1)"))  # closed-form ARE
-ef <- function(pw) qnorm(pmin(pw, 0.999)) + qnorm(0.975)       # power -> noncentrality
+                       alt = "Occurrence trend (vs. Part 1)"))
+ef <- function(pw) qnorm(pmin(pw, 0.999)) + qnorm(0.975)
 e1 <- r1[r1$n == "n = 120" & r1$scen %in% SCEN_LAB[c("occ", "amt")], ]
 e1$ARE <- ifelse(e1$scen == SCEN_LAB["amt"], (ef(e1$MK_full) / ef(e1$MK_amt_exact))^2,
-                 (ef(e1$MK_full) / ef(e1$MK_occ_exact))^2)     # empirical efficiency from power
+                 (ef(e1$MK_full) / ef(e1$MK_occ_exact))^2)
 e1$alt <- ifelse(e1$scen == SCEN_LAB["amt"], "Amount trend (vs. Part 2)", "Occurrence trend (vs. Part 1)")
-e1 <- e1[e1$MK_full >= 0.10, ]                               # drop cells where MK power is at noise level
+e1 <- e1[e1$MK_full >= 0.10, ]
 f3 <- ggplot(th, aes(p0, ARE, linetype = alt)) +
   geom_line(colour = INK, linewidth = 0.6) +
   geom_point(data = e1, aes(p0, ARE, shape = alt), colour = INK, size = 2) +
@@ -1150,13 +1140,13 @@ f3 <- ggplot(th, aes(p0, ARE, linetype = alt)) +
   scale_y_continuous(limits = c(0, 1)) +
   labs(x = "Share of zeros", y = "ARE of MK on the full series") + theme_zi() +
   guides(linetype = guide_legend(title = NULL), shape = "none")
-save_fig(f3, "figA1_are", 4.5, 3.4)                         # appendix A1
+save_fig(f3, "figA1_are", 4.5, 3.4)
 
-## ---- 34. Figure 3 (+ A2, A3): size-adjusted power of all tests ---------------------------
+## ---- Figures 3, A3, A4: size-adjusted power ---------------------------------
 mlab <- c(MK_full = "MK full series", MK_zeros_dropped = "MK zeros dropped",
           TwoPart_FisherMid = "Two-part (proposed)", TwoMK_Bonferroni = "Two MK + Bonferroni",
           ZIQRank_type = "ZIQRank-type", Hurdle_LR = "Hurdle LR", Tobit_Wald = "Tobit Wald")
-power_fig <- function(nn) {                                  # size-adjusted power figure for one n
+power_fig <- function(nn) {
   sp <- rd("step02_power_sizeadjusted.csv"); sp <- sp[sp$n == nn, ]
   lp <- do.call(rbind, lapply(names(mlab), function(m)
     data.frame(dist = sp$dist, scen = sp$scen, p0 = sp$p0, method = mlab[[m]], power = sp[[m]])))
@@ -1170,33 +1160,33 @@ power_fig <- function(nn) {                                  # size-adjusted pow
     labs(x = "Share of zeros", y = "Size-adjusted power (5% level)") + theme_zi() +
     guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
 }
-save_fig(power_fig(64), "fig3_power", 7, 4.6)                # main text (n = 64)
-save_fig(power_fig(30), "figA3_power_n30", 7, 4.6)           # appendix A3
-save_fig(power_fig(120), "figA4_power_n120", 7, 4.6)         # appendix A4
+save_fig(power_fig(64), "fig3_power", 7, 4.6)
+save_fig(power_fig(30), "figA3_power_n30", 7, 4.6)
+save_fig(power_fig(120), "figA4_power_n120", 7, 4.6)
 
-## ---- 35. Figure 4: accuracy of expected-value trend estimators (n = 64) ----------------
+## ---- Figure A2: bias of beta_E estimators -----------------------------------
 COL_E <- c("Two-part plug-in" = "#2a78d6", "Sen's slope" = "#eb6834", "ATS slope" = "#1baf7a",
            "Mean pairwise slope" = "#eda100", "OLS slope" = "#e87ba4", "Hurdle plug-in" = "#008300", "Tobit plug-in" = "#6250d6")
 SHP_E <- setNames(unname(SHP_M), names(COL_E))
 elab <- c(TwoPart = "Two-part plug-in", Sen = "Sen's slope", ATS = "ATS slope",
           MeanPairSlope = "Mean pairwise slope", OLS = "OLS slope", Hurdle = "Hurdle plug-in", Tobit = "Tobit plug-in")
 be <- rd("step02_betaE_accuracy.csv")
-be <- be[be$n == 64 & be$scen %in% c("occ", "amt", "both"), ]   # opposite trends: true beta_E ~ 0 by design (see text)
+be <- be[be$n == 64 & be$scen %in% c("occ", "amt", "both"), ]
 be$estimator <- factor(elab[be$estimator], levels = names(COL_E))
-be$rel_bias <- be$median_bias / abs(be$true_bE)              # median bias relative to the true trend
+be$rel_bias <- be$median_bias / abs(be$true_bE)
 be$scen <- factor(SCEN_LAB[be$scen], levels = SCEN_LAB); be$dist <- factor(DIST_LAB[be$dist], levels = DIST_LAB)
 f5 <- ggplot(be, aes(p0, rel_bias, colour = estimator, shape = estimator)) +
-  geom_hline(yintercept = 0, colour = MUTED, linewidth = 0.4) +               # unbiased
+  geom_hline(yintercept = 0, colour = MUTED, linewidth = 0.4) +
   geom_line(linewidth = 0.5) + geom_point(size = 1.5) +
   scale_colour_manual(values = COL_E) + scale_shape_manual(values = SHP_E) +
   facet_grid(dist ~ scen) + scale_x_continuous(breaks = c(0.3, 0.5, 0.65, 0.8), labels = c("0.3", "0.5", "0.65", "0.8")) +
   scale_y_continuous(labels = function(v) paste0(round(100 * v), "%")) + coord_cartesian(ylim = c(-1.05, 0.6)) +
   labs(x = "Share of zeros", y = expression("Median relative bias of the " * beta[E] * " estimate")) + theme_zi() +
   guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
-save_fig(f5, "figA2_betaE", 6, 4.6)                         # appendix A2 (Table 2 in main text)
+save_fig(f5, "figA2_betaE", 6, 4.6)
 
-## ---- 36. Figure 5 (+ A4): serial dependence ------------------------
-dep_fig <- function(pp) {                                    # dependence figure for one share of zeros
+## ---- Figures 4, A5: serial dependence ---------------------------------------
+dep_fig <- function(pp) {
 r4 <- rd("step04_rejection_rates.csv"); r4 <- r4[r4$p0 == pp, ]
 vlab <- c(MK_full = "MK full series|Naive", MK_full_HR = "MK full series|Hamed-Rao",
           MK_full_BlockPerm = "MK full series|Block permutation", TwoPart_naive = "Two-part (proposed)|Naive",
@@ -1214,19 +1204,19 @@ l4$shape <- factor(ifelse(l4$shape == 0.8, "Shape 0.8\n(precipitation-like)", "S
 ref <- data.frame(scen = factor(SCEN_LAB["H0"], levels = levels(l4$scen)), y = 0.05)
 ggplot(l4, aes(dep, rate, colour = family, linetype = version, shape = version,
                      group = interaction(family, version))) +
-  geom_hline(data = ref, aes(yintercept = y), colour = MUTED, linewidth = 0.4) +   # nominal 5 % (H0 panels)
+  geom_hline(data = ref, aes(yintercept = y), colour = MUTED, linewidth = 0.4) +
   geom_line(linewidth = 0.5) + geom_point(size = 1.6) +
   scale_colour_manual(values = COL_M[c("Two-part (proposed)", "MK full series")]) +
   scale_linetype_manual(values = c("solid", "42", "11")) + scale_shape_manual(values = c(16, 17, 15)) +
   facet_grid(shape ~ scen) +
   labs(x = "Serial dependence", y = "Rejection rate (5% level)") + theme_zi()
 }
-save_fig(dep_fig(0.3), "fig4_dependence", 7, 4.6)            # main text Fig. 4 (share of zeros 0.3)
-save_fig(dep_fig(0.6), "figA5_dependence_p06", 7, 4.6)       # appendix A5 (share of zeros 0.6)
+save_fig(dep_fig(0.3), "fig4_dependence", 7, 4.6)
+save_fig(dep_fig(0.6), "figA5_dependence_p06", 7, 4.6)
 
-## ---- 37. Figure 6: real series, MK vs two-part p-values ------------------------------------
+## ---- Figure 5: MK versus two-part p-values ----------------------------------
 rr <- if (exists("real5")) real5 else rd("step05_real_robust_series.csv")
-cap <- 7                                                     # cap -log10 p for display
+cap <- 7
 rr$x <- pmin(-log10(rr$p_MK_full), cap); rr$y <- pmin(-log10(rr$p_TwoPart), cap)
 rr$grp <- ifelse(rr$p_TwoPart < 0.05 & rr$p_MK_full >= 0.05, "Significant by two-part only",
            ifelse(rr$p_MK_full < 0.05 & rr$p_TwoPart >= 0.05, "Significant by MK only",
@@ -1236,7 +1226,7 @@ rr$sen <- factor(ifelse(rr$sen_zero, "Sen slope = 0", "Sen slope nonzero"), leve
 rr$app <- factor(ifelse(rr$application == "USGS_streamflow", "Intermittent streamflow (USGS)", "Arid-region precipitation (GHCN-Daily)"),
                  levels = c("Arid-region precipitation (GHCN-Daily)", "Intermittent streamflow (USGS)"))
 cnt <- aggregate(cbind(tp = grp == "Significant by two-part only", mk = grp == "Significant by MK only") ~ app, rr, sum)
-cnt$lab <- paste0("Two-part only: ", cnt$tp, "\nMK only: ", cnt$mk)  # counts shown in each panel
+cnt$lab <- paste0("Two-part only: ", cnt$tp, "\nMK only: ", cnt$mk)
 f7 <- ggplot(rr, aes(x, y)) +
   geom_abline(slope = 1, intercept = 0, colour = GRID, linewidth = 0.4) +
   geom_hline(yintercept = -log10(0.05), linetype = "22", colour = MUTED, linewidth = 0.4) +
@@ -1249,39 +1239,38 @@ f7 <- ggplot(rr, aes(x, y)) +
   facet_wrap(~ app, nrow = 1) + coord_equal(xlim = c(0, cap), ylim = c(0, cap)) +
   labs(x = expression(-log[10] * " p  (MK, full series)"), y = expression(-log[10] * " p  (two-part test)")) +
   theme_zi() + guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
-save_fig(f7, "fig5_real_pvalues", 7, 4.4)                   # main text Fig. 5
+save_fig(f7, "fig5_real_pvalues", 7, 4.4)
 
 message("figures written to: ", fig_dir)
 
 ############################################################################
-## ===========================  STEP 07  ===================================
-## Streamflow data audit (uses only the cached daily files dv_<site>.rds)
+## Step 07: streamflow data audit and sensitivity analyses
 ############################################################################
 if (!is.null(resA)) {
-  audit_one <- function(site) {                              # record diagnostics for one gauge
+  audit_one <- function(site) {
     d <- readRDS(file.path(flow_dir, paste0("dv_", site, ".rds")))
     yr <- as.integer(format(d$date, "%Y"))
-    ndays <- table(factor(yr, levels = FLOW_YEARS))          # days with a value in each year
-    full <- as.integer(ndays) >= 0.9 * 365                   # >= 90 % of days observed
-    miss <- FLOW_YEARS[!full]                                # years without a near-complete record
+    ndays <- table(factor(yr, levels = FLOW_YEARS))
+    full <- as.integer(ndays) >= 0.9 * 365
+    miss <- FLOW_YEARS[!full]
     longest_gap <- if (length(miss)) max(tapply(miss, cumsum(c(1, diff(miss) != 1)), length)) else 0
     pos <- d$q[d$q > 0]
     data.frame(id = site, first_date = min(d$date), last_date = max(d$date),
                n_years_complete = sum(full), longest_gap_years = longest_gap,
-               n_missing_years = length(miss),                        # incomplete years in the window
+               n_missing_years = length(miss),
                missing_years = if (length(miss)) paste(tapply(miss, cumsum(c(1, diff(miss) != 1)),
                                             function(v) if (length(v) > 1) paste(range(v), collapse = "-") else v),
-                                     collapse = "; ") else "",          # e.g. "1986-2000"
+                                     collapse = "; ") else "",
                share_zero_days = round(mean(d$q == 0), 3),
-               min_positive_cfs = if (length(pos)) min(pos) else NA,         # measurement resolution
-               share_days_below_0.1cfs = round(mean(d$q > 0 & d$q < 0.1), 4))  # tiny flows (rounding-sensitive)
+               min_positive_cfs = if (length(pos)) min(pos) else NA,
+               share_days_below_0.1cfs = round(mean(d$q > 0 & d$q < 0.1), 4))
   }
   aud <- do.call(rbind, lapply(unique(resA$id), audit_one))
   aud <- merge(unique(resA[, c("id", "name", "state")]), aud, by = "id")
-  aud$flag_long_gap <- aud$longest_gap_years > 5             # flags used for a sensitivity analysis
+  aud$flag_long_gap <- aud$longest_gap_years > 5
   write.csv(aud, file.path(out_dir, "step07_flow_audit.csv"), row.names = FALSE)
 
-  ## year-by-year record of the Figure 1 streamflow gauges
+  ## Figure 1 gauges: record by year
   fig_ids <- unique(case_series$id[case_series$application == "USGS_streamflow"])
   yr_tab <- do.call(rbind, lapply(fig_ids, function(site) {
     d <- readRDS(file.path(flow_dir, paste0("dv_", site, ".rds")))
@@ -1294,16 +1283,16 @@ if (!is.null(resA)) {
   }))
   write.csv(yr_tab, file.path(out_dir, "step07_case_gauge_years.csv"), row.names = FALSE)
 
-  ## sensitivity: drop gauges with a gap > 5 years; and Zipper et al. style rounding (q < 0.05 cfs -> 0)
+  ## sensitivity: no gaps > 5 years; daily flows rounded to 0.1 cfs; no dam-regulated gauges
   sens <- function(r, label) data.frame(subset = label, n_series = nrow(r),
     sig_MK_full = mean(r$p_MK_full < 0.05), sig_TwoPart = mean(r$p_TwoPart < 0.05),
     TwoPart_only = mean(r$p_TwoPart < 0.05 & r$p_MK_full >= 0.05),
     MKfull_only = mean(r$p_MK_full < 0.05 & r$p_TwoPart >= 0.05), share_Sen_zero = mean(r$sen_zero))
   ok_ids <- aud$id[!aud$flag_long_gap]
-  flow_r <- do.call(rbind, lapply(cand$site_no, function(site) {   # monthly tables with rounded daily flows
+  flow_r <- do.call(rbind, lapply(cand$site_no, function(site) {
     f <- file.path(flow_dir, paste0("dv_", site, ".rds")); if (!file.exists(f)) return(NULL)
     d <- readRDS(f); if (nrow(d) == 0) return(NULL)
-    q <- round(d$q, 1)                                       # one decimal place, as in Zipper et al.
+    q <- round(d$q, 1)  # 0.1 cfs, as in Zipper et al.
     monthly_from_daily(site, as.integer(format(d$date, "%Y")), as.integer(format(d$date, "%m")), q,
                        wet_fun = function(x) x > 0, stat = "mean")
   }))
@@ -1320,65 +1309,63 @@ if (!is.null(resA)) {
 }
 
 ############################################################################
-## ===========================  STEP 08  ===================================
-## Final numbers: effect sizes with 95% intervals for every real series,
-## and manuscript Tables 1-3 (CSV, ready to paste)
+## Step 08: effect sizes and Tables 1-3
 ############################################################################
-tab_dir <- file.path(out_dir, "tables"); dir.create(tab_dir, showWarnings = FALSE)  # table folder
+tab_dir <- file.path(out_dir, "tables"); dir.create(tab_dir, showWarnings = FALSE)
 
-## ---- 38. Effect-size tools ------------------------------------------------------------------
-firth_fit <- function(t, I) {                                # Firth logistic slope with Wald standard error
-  tc <- t - mean(t); X <- cbind(1, tc); b <- c(0, 0)         # centred design
+## ---- Effect-size tools ------------------------------------------------------
+firth_fit <- function(t, I) {
+  tc <- t - mean(t); X <- cbind(1, tc); b <- c(0, 0)
   for (i in 1:50) {
     p <- plogis(drop(X %*% b)); w <- p * (1 - p)
-    Iinv <- solve(crossprod(X * sqrt(w)))                    # inverse information
-    h <- rowSums((X %*% Iinv) * X) * w                       # leverages
-    step <- drop(Iinv %*% crossprod(X, I - p + h * (0.5 - p)))  # Firth-modified score step
+    Iinv <- solve(crossprod(X * sqrt(w)))
+    h <- rowSums((X %*% Iinv) * X) * w
+    step <- drop(Iinv %*% crossprod(X, I - p + h * (0.5 - p)))
     b <- b + step; if (max(abs(step)) < 1e-8) break
   }
   p <- plogis(drop(X %*% b)); Iinv <- solve(crossprod(X * sqrt(p * (1 - p))))
-  b <- unname(b)                                             # drop column names (else "b.tc")
+  b <- unname(b)
   c(a = b[1] - b[2] * mean(t), b = b[2], se = sqrt(Iinv[2, 2]))
 }
-sen_ci <- function(x, t) {                                   # Sen slope + distribution-free 95% interval (Gilbert 1987)
+sen_ci <- function(x, t) {
   i <- combn(length(x), 2); dt <- t[i[2, ]] - t[i[1, ]]
-  sl <- sort(((x[i[2, ]] - x[i[1, ]]) / dt)[dt != 0])        # pairwise slopes (no equal times)
+  sl <- sort(((x[i[2, ]] - x[i[1, ]]) / dt)[dt != 0])
   N <- length(sl); n <- length(x)
   tie <- rle(sort(x))$lengths
-  v <- (n * (n - 1) * (2 * n + 5) - sum(tie * (tie - 1) * (2 * tie + 5))) / 18  # Var(S), tie-corrected
+  v <- (n * (n - 1) * (2 * n + 5) - sum(tie * (tie - 1) * (2 * tie + 5))) / 18
   C <- qnorm(0.975) * sqrt(v)
-  lo <- max(1, floor((N - C) / 2)); hi <- min(N, ceiling((N + C) / 2) + 1)   # order-statistic ranks
+  lo <- max(1, floor((N - C) / 2)); hi <- min(N, ceiling((N + C) / 2) + 1)
   c(b = median(sl), lo = sl[lo], hi = sl[hi])
 }
-betaE_fun <- function(y, t) {                                # two-part plug-in trend of E[y] (Eq. 11)
+betaE_fun <- function(y, t) {
   I <- as.numeric(y > 0); pos <- which(y > 0)
   if (length(pos) < 3 || length(pos) == length(y)) return(NA_real_)
   fo <- firth_fit(t, I); ph <- plogis(fo[["a"]] + fo[["b"]] * t)
   xp <- log(y[pos]); tp <- t[pos]; i <- combn(length(xp), 2); dt <- tp[i[2, ]] - tp[i[1, ]]
-  bs <- median(((xp[i[2, ]] - xp[i[1, ]]) / dt)[dt != 0])    # Sen slope of log amounts (ties in time skipped)
-  as <- median(xp - bs * tp); sm <- mean(exp(xp - as - bs * tp))  # median intercept, smearing
+  bs <- median(((xp[i[2, ]] - xp[i[1, ]]) / dt)[dt != 0])
+  as <- median(xp - bs * tp); sm <- mean(exp(xp - as - bs * tp))
   ols_slope(ph * exp(as + bs * t) * sm, t)
 }
-effects_one <- function(y, t, B = 999) {                     # all effect sizes for one series
+effects_one <- function(y, t, B = 999) {
   I <- as.numeric(y > 0); pos <- which(y > 0)
-  fo <- firth_fit(t, I)                                      # occurrence slope (log-odds per year)
-  sc <- sen_ci(log(y[pos]), t[pos])                          # amount slope (log units per year)
+  fo <- firth_fit(t, I)
+  sc <- sen_ci(log(y[pos]), t[pos])
   bE <- betaE_fun(y, t)
-  bb <- replicate(B, { k <- sample.int(length(y), replace = TRUE); betaE_fun(y[k], t[k]) })  # case bootstrap
+  bb <- replicate(B, { k <- sample.int(length(y), replace = TRUE); betaE_fun(y[k], t[k]) })
   q <- quantile(bb, c(0.025, 0.975), na.rm = TRUE)
   c(b_occ = fo[["b"]], b_occ_lo = fo[["b"]] - 1.96 * fo[["se"]], b_occ_hi = fo[["b"]] + 1.96 * fo[["se"]],
     b_amt = sc[["b"]], b_amt_lo = sc[["lo"]], b_amt_hi = sc[["hi"]],
     betaE = bE, betaE_lo = q[[1]], betaE_hi = q[[2]])
 }
 
-## ---- 39. Effect sizes for all real series (cached) -----------------------------------------
+## ---- Effect sizes for all real series (cached) ------------------------------
 eff_file <- file.path(out_dir, "step08_effects.rds")
 if (file.exists(eff_file)) {
   eff <- readRDS(eff_file); message("step08_effects.rds found - skipped.")
 } else {
   jobs8 <- rbind(if (!is.null(resA)) data.frame(application = "USGS_streamflow", id = resA$id, month = resA$month),
                  data.frame(application = "GHCN_precip", id = resB$id, month = resB$month))
-  ser8 <- lapply(seq_len(nrow(jobs8)), function(i) {         # rebuild each analysed series
+  ser8 <- lapply(seq_len(nrow(jobs8)), function(i) {
     mon <- if (jobs8$application[i] == "USGS_streamflow") flow_mon else prcp_mon
     d <- mon[mon$id == jobs8$id[i] & mon$month == jobs8$month[i] & mon$complete, ]
     d <- d[order(d$year), ]; list(y = d$value, t = d$year)
@@ -1386,16 +1373,16 @@ if (file.exists(eff_file)) {
   cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("firth_fit", "sen_ci", "betaE_fun", "effects_one", "ols_slope"))
   eff <- do.call(rbind, parLapply(cl, seq_along(ser8), function(i, ser8) {
-    set.seed(8000 + i); effects_one(ser8[[i]]$y, ser8[[i]]$t)   # series-specific seed
+    set.seed(8000 + i); effects_one(ser8[[i]]$y, ser8[[i]]$t)
   }, ser8 = ser8))
   stopCluster(cl)
   eff <- cbind(jobs8, as.data.frame(eff)); saveRDS(eff, eff_file)
 }
-eff$OR_occ_decade <- exp(10 * eff$b_occ)                     # odds ratio of a non-zero month per decade
-eff$amt_pct_decade <- 100 * (exp(10 * eff$b_amt) - 1)        # % change of positive amounts per decade
-eff$betaE_decade <- 10 * eff$betaE                           # change of E[y] per decade (mm or cfs)
-eff$betaE_CI_excl0 <- eff$betaE_lo > 0 | eff$betaE_hi < 0    # 95% interval excludes zero
-eff$OR_occ_decade_lo <- exp(10 * eff$b_occ_lo); eff$OR_occ_decade_hi <- exp(10 * eff$b_occ_hi)          # same units as the estimate
+eff$OR_occ_decade <- exp(10 * eff$b_occ)
+eff$amt_pct_decade <- 100 * (exp(10 * eff$b_amt) - 1)
+eff$betaE_decade <- 10 * eff$betaE
+eff$betaE_CI_excl0 <- eff$betaE_lo > 0 | eff$betaE_hi < 0
+eff$OR_occ_decade_lo <- exp(10 * eff$b_occ_lo); eff$OR_occ_decade_hi <- exp(10 * eff$b_occ_hi)
 eff$amt_pct_decade_lo <- 100 * (exp(10 * eff$b_amt_lo) - 1); eff$amt_pct_decade_hi <- 100 * (exp(10 * eff$b_amt_hi) - 1)
 eff$betaE_decade_lo <- 10 * eff$betaE_lo; eff$betaE_decade_hi <- 10 * eff$betaE_hi
 eff <- merge(eff, rbind(if (!is.null(resA)) cbind(application = "USGS_streamflow", resA[, c("id", "month", "p_TwoPart", "p_MK_full", "p_occ_exact", "p_amt_exact", "sen_zero")]),
@@ -1405,10 +1392,10 @@ write.csv(eff, file.path(out_dir, "step08_real_effects.csv"), row.names = FALSE)
 
 eff_sum <- do.call(rbind, lapply(split(eff, eff$application), function(r) data.frame(
   application = r$application[1], n_series = nrow(r),
-  share_betaE_CI_excl0 = mean(r$betaE_CI_excl0, na.rm = TRUE),                       # E[y] trend clearly non-zero
+  share_betaE_CI_excl0 = mean(r$betaE_CI_excl0, na.rm = TRUE),
   share_occCI_excl0 = mean(r$b_occ_lo > 0 | r$b_occ_hi < 0),
   share_amtCI_excl0 = mean(r$b_amt_lo > 0 | r$b_amt_hi < 0, na.rm = TRUE),
-  share_betaE_CI_excl0_given_Sen0 = mean(r$betaE_CI_excl0[r$sen_zero], na.rm = TRUE),  # Sen = 0 but E[y] trend
+  share_betaE_CI_excl0_given_Sen0 = mean(r$betaE_CI_excl0[r$sen_zero], na.rm = TRUE),
   agree_sig_TwoPart_vs_CI = mean((r$p_TwoPart < 0.05) == (r$b_occ_lo > 0 | r$b_occ_hi < 0 | r$b_amt_lo > 0 | r$b_amt_hi < 0), na.rm = TRUE))))
 num <- sapply(eff_sum, is.numeric); eff_sum[num] <- round(eff_sum[num], 4)
 write.csv(eff_sum, file.path(out_dir, "step08_effects_summary.csv"), row.names = FALSE)
@@ -1416,12 +1403,12 @@ write.csv(eff_sum, file.path(out_dir, "step08_effects_summary.csv"), row.names =
 cases_eff <- merge(cases[, c("application", "id", "name", "month")],
                    eff[, c("application", "id", "month", "OR_occ_decade", "OR_occ_decade_lo", "OR_occ_decade_hi",
                            "amt_pct_decade", "amt_pct_decade_lo", "amt_pct_decade_hi",
-                           "betaE_decade", "betaE_decade_lo", "betaE_decade_hi")],  # all per decade, CIs in the same units
+                           "betaE_decade", "betaE_decade_lo", "betaE_decade_hi")],
                    by = c("application", "id", "month"))
 cases_eff <- cases_eff[paste(cases_eff$id, cases_eff$month) %in% paste(case_series$id, case_series$month), ]
-write.csv(cases_eff, file.path(tab_dir, "case_effects_fig1.csv"), row.names = FALSE)   # numbers quoted with Fig. 1
+write.csv(cases_eff, file.path(tab_dir, "case_effects_fig1.csv"), row.names = FALSE)
 
-## ---- 40. Table 1: empirical size (5% level) --------------------------------------------------
+## ---- Table 1: empirical size ------------------------------------------------
 sz <- rd("step02_size_H0.csv")
 t1 <- sz[sz$n %in% c(30, 64, 120) & sz$p0 %in% c(0.3, 0.8),
          c("dist", "n", "p0", "MK_full_5", "MK_zeros_dropped_5", "TwoPart_FisherMid_5", "TwoMK_Bonferroni_5",
@@ -1431,15 +1418,15 @@ names(t1) <- c("Amounts", "n", "Share of zeros", "MK full", "MK zeros dropped", 
 t1 <- t1[order(t1$Amounts, t1$n, t1$`Share of zeros`), ]
 write.csv(t1, file.path(tab_dir, "table1_size.csv"), row.names = FALSE)
 
-## ---- 41. Table 2: expected-value trend estimators (n = 64) ------------------------------------
+## ---- Table 2: beta_E estimators ---------------------------------------------
 be2 <- rd("step02_betaE_accuracy.csv"); be2 <- be2[be2$n == 64 & be2$scen %in% c("occ", "amt", "both"), ]
 be2$rb <- be2$median_bias / abs(be2$true_bE); be2$rm <- be2$mad_err / abs(be2$true_bE)
-t2 <- aggregate(cbind(rb, rm, share_zero) ~ dist + estimator, be2, median)   # median over scenarios x zero shares
+t2 <- aggregate(cbind(rb, rm, share_zero) ~ dist + estimator, be2, median)
 names(t2) <- c("Amounts", "Estimator", "Median relative bias", "Median relative |error|", "Share of estimates = 0")
 t2[, 3:5] <- round(t2[, 3:5], 3); t2 <- t2[order(t2$Amounts, t2$`Median relative |error|`), ]
 write.csv(t2, file.path(tab_dir, "table2_betaE.csv"), row.names = FALSE)
 
-## ---- 42. Table 3: real data -----------------------------------------------------------------------
+## ---- Table 3: real data -----------------------------------------------------
 row3 <- function(r, label) {
   s <- summarise_app(r, label)
   s[, c("application", "n_series", "n_sites", "median_zero_share", "share_Sen_zero", "sig_MK_full", "sig_TwoPart",
@@ -1451,86 +1438,82 @@ t3 <- rbind(
   if (!is.null(resA)) row3(resA_r, "Streamflow: daily flow rounded to 0.1 cfs"),
   if (!is.null(resA)) row3(resA[!grepl("DAM", toupper(resA$name)), ], "Streamflow: without dam-regulated gauges"),
   row3(resB, "Precipitation: 1 mm threshold (main)"),
-  row3(resB_raw, "Precipitation: 0 mm threshold (= 0.1 mm, the GHCN recording resolution)"))  # 0 and 0.1 mm give identical series
+  row3(resB_raw, "Precipitation: 0 mm threshold (= 0.1 mm, the GHCN recording resolution)"))
 bp <- aggregate(cbind(sig_MK_full_BP = p_full_bp < 0.05, sig_TwoPart_BP = p_tp_bp < 0.05) ~ application, real5, mean)
-t3$sig_MK_full_BP <- NA; t3$sig_TwoPart_BP <- NA             # block-permutation versions (main rows only)
+t3$sig_MK_full_BP <- NA; t3$sig_TwoPart_BP <- NA
 t3[t3$application == "Streamflow: all gauges (main)", c("sig_MK_full_BP", "sig_TwoPart_BP")] <- bp[bp$application == "USGS_streamflow", 2:3]
 t3[t3$application == "Precipitation: 1 mm threshold (main)", c("sig_MK_full_BP", "sig_TwoPart_BP")] <- bp[bp$application == "GHCN_precip", 2:3]
 num <- sapply(t3, is.numeric); t3[num] <- round(t3[num], 3)
-stopifnot(isTRUE(all.equal(summarise_app(resB_01, "x")[, -1], summarise_app(resB_raw, "x")[, -1])))  # check: 0.1 mm == 0 mm
+stopifnot(isTRUE(all.equal(summarise_app(resB_01, "x")[, -1], summarise_app(resB_raw, "x")[, -1])))
 write.csv(t3, file.path(tab_dir, "table3_real.csv"), row.names = FALSE)
 
 print(t3, row.names = FALSE); print(eff_sum, row.names = FALSE)
 message("step08 outputs written to: ", out_dir, " and ", tab_dir)
 
 ############################################################################
-## ===========================  STEP 09  ===================================
-## Serial dependence at other record lengths (n = 30 and n = 120).
-## Same generator, dependence levels, shapes, scenarios and zero shares as step04 (n = 64),
-## so the three lengths can be compared directly. Each cell is saved as soon as it finishes:
-## if R is stopped, the next run continues from the first unfinished cell.
+## Step 09: serial dependence at n = 30 and n = 120
 ############################################################################
-N9 <- c(30, 120)                                             # new record lengths (n = 64 is step04)
+N9 <- c(30, 120)                        # record lengths (n = 64: step 04)
 grid9 <- expand.grid(scen = SCEN4, p0 = P04, dep = DEP$dep, shape = SHAPES4, n = N9,
-                     stringsAsFactors = FALSE)               # 2 x 2 x 3 x 2 x 4 = 96 cells
-grid9 <- merge(grid9, DEP, by = "dep")                       # add rhoI and rhoA
-grid9 <- grid9[order(grid9$n, grid9$shape, grid9$dep, grid9$scen, grid9$p0), ]  # fixed cell order
-grid9$cell <- seq_len(nrow(grid9))                           # cell number = checkpoint name
-cache9_dir <- file.path(out_dir, "cache_step09"); dir.create(cache9_dir, showWarnings = FALSE)  # checkpoint folder
+                     stringsAsFactors = FALSE)
+grid9 <- merge(grid9, DEP, by = "dep")
+grid9 <- grid9[order(grid9$n, grid9$shape, grid9$dep, grid9$scen, grid9$p0), ]
+grid9$cell <- seq_len(nrow(grid9))
+cache9_dir <- file.path(out_dir, "cache_step09"); dir.create(cache9_dir, showWarnings = FALSE)
 
-run_cell9 <- function(k, grid, cache_dir) {                  # one cell: R4 series, all tests
-  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))     # checkpoint file of this cell
-  if (file.exists(f)) return(readRDS(f))                     # already done -> read it
-  g <- grid[k, ]; set.seed(9000 + k)                         # cell-specific seed (reproducible)
-  eff <- scen_eff[[g$scen]]                                  # trend effects of the scenario
-  res <- t(replicate(R4, dep_stats(gen_dep(g$n, g$p0, eff[1], eff[2], g$rhoI, g$rhoA, g$shape))))  # simulate + test
-  res <- cbind(cell = k, res); saveRDS(res, f); res          # save checkpoint and return
+run_cell9 <- function(k, grid, cache_dir) {
+  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))
+  if (file.exists(f)) return(readRDS(f))
+  g <- grid[k, ]; set.seed(9000 + k)
+  eff <- scen_eff[[g$scen]]
+  res <- t(replicate(R4, dep_stats(gen_dep(g$n, g$p0, eff[1], eff[2], g$rhoI, g$rhoA, g$shape))))
+  res <- cbind(cell = k, res); saveRDS(res, f); res
 }
 
-raw9_file <- file.path(out_dir, "step09_raw.rds")            # final step09 cache
-if (file.exists(raw9_file)) {                                # everything already computed
+raw9_file <- file.path(out_dir, "step09_raw.rds")
+if (file.exists(raw9_file)) {
   raw9 <- readRDS(raw9_file); message("step09_raw.rds found - simulation skipped.")
 } else {
-  t0 <- Sys.time()                                           # start clock
-  todo <- sum(!file.exists(file.path(cache9_dir, sprintf("cell_%03d.rds", grid9$cell))))  # unfinished cells
+  t0 <- Sys.time()
+  todo <- sum(!file.exists(file.path(cache9_dir, sprintf("cell_%03d.rds", grid9$cell))))
   message("step09: ", todo, " of ", nrow(grid9), " cells to compute.")
-  cl <- makeCluster(max(1, detectCores() - 1))               # one worker per core, one core left free
+  cl <- makeCluster(max(1, detectCores() - 1))
   clusterExport(cl, c("gen_dep", "S_stat", "mk_asym", "mk_hr", "sen_slope", "p_amt_exact", "p_occ_exact",
                       "p_fisher", "fisher_stat", "block_perm_p", "dep_stats", "scen_eff", "KEND",
-                      "R4", "B4", "MU0"))                    # functions and constants the workers need
-  ord <- grid9$cell[order(-grid9$n)]                         # long series first (better load balance)
+                      "R4", "B4", "MU0"))
+  ord <- grid9$cell[order(-grid9$n)]
   raw9 <- as.data.frame(do.call(rbind, parLapplyLB(cl, ord, run_cell9, grid = grid9, cache_dir = cache9_dir)))
-  stopCluster(cl)                                            # close workers
-  raw9 <- merge(grid9, raw9, by = "cell"); saveRDS(raw9, raw9_file)  # attach cell settings and save
+  stopCluster(cl)
+  raw9 <- merge(grid9, raw9, by = "cell"); saveRDS(raw9, raw9_file)
   message("step09 run time: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
 }
 
-## ---- 43. step09 tables: rejection rates for n = 30, 64, 120 ----------------------------------------
+## ---- Rejection rates for n = 30, 64, 120 ------------------------------------
 rej9 <- do.call(rbind, lapply(split(raw9, raw9$cell), function(d) {
-  r <- sapply(tests4, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))  # rejection rate at 5 %
+  r <- sapply(tests4, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))
   data.frame(n = d$n[1], shape = d$shape[1], dep = d$dep[1], rhoI = d$rhoI[1], rhoA = d$rhoA[1],
              scen = d$scen[1], p0 = d$p0[1], t(round(r, 3)),
              mean_f_occ = round(mean(d$f_occ), 2), mean_f_amt = round(mean(d$f_amt), 2))
 }))
-rej64 <- rd("step04_rejection_rates.csv"); rej64 <- cbind(n = 64, rej64)  # n = 64 from step04 (same design)
-rejN <- rbind(rej9, rej64[, names(rej9)])                    # all three lengths in one table
+rej64 <- rd("step04_rejection_rates.csv"); rej64 <- cbind(n = 64, rej64)
+rejN <- rbind(rej9, rej64[, names(rej9)])
 rejN <- rejN[order(rejN$n, rejN$shape, match(rejN$scen, SCEN4), rejN$rhoI, rejN$p0), ]
 write.csv(rejN, file.path(out_dir, "step09_dependence_by_n.csv"), row.names = FALSE)
 
-sizeN <- rejN[rejN$scen == "H0", ]                           # size only (no-trend cells)
+sizeN <- rejN[rejN$scen == "H0", ]
 size_rng <- aggregate(cbind(TwoPart_naive, TwoPart_HR, TwoPart_BlockPerm, MK_full, MK_full_BlockPerm) ~ n + dep,
-                      sizeN, function(x) paste0(min(x), "-", max(x)))  # range over shapes and zero shares
+                      sizeN, function(x) paste0(min(x), "-", max(x)))
 write.csv(size_rng, file.path(out_dir, "step09_size_ranges.csv"), row.names = FALSE)
-print(size_rng, row.names = FALSE)                           # quick look in the console
+print(size_rng, row.names = FALSE)
 
-## ---- 44. Figure A6: size under dependence for n = 30, 64, 120 ----------------------------------------
-library(ggplot2)                                             # (already loaded by step06)
+## ---- Figure A6: size under dependence by record length ----------------------
+library(ggplot2)
 fig_dir <- file.path(out_dir, "figures"); dir.create(fig_dir, showWarnings = FALSE)
 vlab9 <- c(MK_full = "MK full series|Naive", MK_full_HR = "MK full series|Hamed-Rao",
            MK_full_BlockPerm = "MK full series|Block permutation", TwoPart_naive = "Two-part (proposed)|Naive",
            TwoPart_HR = "Two-part (proposed)|Hamed-Rao", TwoPart_BlockPerm = "Two-part (proposed)|Block permutation")
-s9 <- sizeN[sizeN$p0 == 0.3, ]                               # share of zeros 0.3 (as main-text Fig. 4)
-l9 <- do.call(rbind, lapply(names(vlab9), function(m) {      # long format: one row per test version
+s9 <- sizeN[sizeN$p0 == 0.3, ]
+l9 <- do.call(rbind, lapply(names(vlab9), function(m) {
   s <- strsplit(vlab9[[m]], "\\|")[[1]]
   data.frame(n = s9$n, shape = s9$shape, dep = s9$dep, family = s[1], version = s[2], rate = s9[[m]])
 }))
@@ -1542,12 +1525,60 @@ l9$shape <- factor(ifelse(l9$shape == 0.8, "Shape 0.8\n(precipitation-like)", "S
                    levels = c("Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"))
 fA6 <- ggplot(l9, aes(dep, rate, colour = family, linetype = version, shape = version,
                       group = interaction(family, version))) +
-  geom_hline(yintercept = 0.05, colour = MUTED, linewidth = 0.4) +   # nominal 5 % level
+  geom_hline(yintercept = 0.05, colour = MUTED, linewidth = 0.4) +
   geom_line(linewidth = 0.5) + geom_point(size = 1.6) +
   scale_colour_manual(values = COL_M[c("Two-part (proposed)", "MK full series")]) +
   scale_linetype_manual(values = c("solid", "42", "11")) + scale_shape_manual(values = c(16, 17, 15)) +
-  facet_grid(shape ~ n) +                                    # rows: amount shape, columns: record length
+  facet_grid(shape ~ n) +
   labs(x = "Serial dependence", y = "Rejection rate under no trend (5% level)") + theme_zi()
-save_fig(fA6, "figA6_dependence_size_by_n", 6.5, 4.6)        # appendix Figure A6
+save_fig(fA6, "figA6_dependence_size_by_n", 6.5, 4.6)
 
 message("step09 outputs written to: ", out_dir)
+
+############################################################################
+## Step 10: summary tables, site lists and monthly series
+############################################################################
+## ---- Relative power of the seven tests --------------------------------------
+sp11 <- rd("step02_power_sizeadjusted.csv")
+tests11 <- c("MK_full", "MK_zeros_dropped", "TwoPart_FisherMid", "TwoMK_Bonferroni",
+             "ZIQRank_type", "Hurdle_LR", "Tobit_Wald")
+best11 <- apply(sp11[, tests11], 1, max)
+rel11 <- sp11[, tests11] / best11
+worst11 <- aggregate(rel11, by = list(group = sp11$dist), FUN = function(x) min(x, na.rm = TRUE))
+mean11 <- aggregate(rel11, by = list(group = sp11$scen), FUN = mean)
+mean11$group <- paste0("mean_", mean11$group)
+best_cnt <- aggregate(tests11[max.col(sp11[, tests11], ties.method = "first")],
+                      by = list(dist = sp11$dist, scen = sp11$scen),
+                      FUN = function(x) paste(names(table(x)), table(x), sep = ":", collapse = " "))
+names(best_cnt)[3] <- "best_test_counts"
+rp11 <- rbind(cbind(type = "worst_case", worst11), cbind(type = "mean", mean11))
+rp11[tests11] <- round(rp11[tests11], 3)
+write.csv(rp11, file.path(tab_dir, "step10_relpower_summary.csv"), row.names = FALSE)
+write.csv(best_cnt, file.path(tab_dir, "step10_best_test_counts.csv"), row.names = FALSE)
+print(rp11, row.names = FALSE)
+
+## ---- Sites by state and region ----------------------------------------------
+gauges <- unique(resA[, c("id", "name", "state")])
+stations <- unique(resB[, c("id", "name", "region", "lat", "lon")])
+by_state <- data.frame(data = "streamflow", area = names(table(gauges$state)), sites = as.integer(table(gauges$state)))
+reg_n <- sapply(regions$region, function(r) sum(stations$region == r))
+by_region <- data.frame(data = "precipitation", area = regions$region, sites = as.integer(reg_n))
+sites11 <- rbind(by_state, by_region)
+sites11$series <- c(sapply(by_state$area, function(a) sum(resA$state == a)),
+                    sapply(by_region$area, function(a) sum(resB$region == a)))
+write.csv(sites11, file.path(tab_dir, "step10_sites_by_area.csv"), row.names = FALSE)
+print(sites11, row.names = FALSE)
+
+## ---- Site lists and monthly series ------------------------------------------
+CMS <- 0.0283168                        # cfs -> m3/s
+gauges$n_series <- as.integer(table(resA$id)[gauges$id])
+stations$n_series <- as.integer(table(resB$id)[stations$id])
+write.csv(gauges, file.path(tab_dir, "streamflow_gauges.csv"), row.names = FALSE)
+write.csv(stations, file.path(tab_dir, "precipitation_stations.csv"), row.names = FALSE)
+fm <- flow_mon[flow_mon$id %in% gauges$id & flow_mon$year %in% FLOW_YEARS, c("id", "year", "month", "complete", "value")]
+names(fm)[5] <- "flow_cfs"; fm$flow_m3s <- signif(fm$flow_cfs * CMS, 6)
+write.csv(fm, file.path(tab_dir, "streamflow_monthly.csv"), row.names = FALSE)
+pm <- prcp_mon_raw[prcp_mon_raw$id %in% stations$id, c("id", "year", "month", "complete", "value")]
+names(pm)[5] <- "precip_mm"
+write.csv(pm, file.path(tab_dir, "precipitation_monthly.csv"), row.names = FALSE)
+message("step10 outputs written to: ", tab_dir)
