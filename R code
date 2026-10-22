@@ -1,6 +1,6 @@
 ############################################################################
 ## paperZI - Two-part Mann-Kendall trend test for zero-inflated series
-## step01-08b (cumulative, FINAL)
+## step01-10 (cumulative)
 ##   step01: methods + baseline Monte Carlo (cached in step01_raw_v2.rds -> skipped)
 ##   step02: competitors (Bonferroni, ZIQRank-type, hurdle, Tobit, ATS),
 ##           stabilised expected-value trend (beta_E), heavy-tailed amounts (cached -> skipped)
@@ -17,6 +17,9 @@
 ##   step07: streamflow data audit (record gaps, zero-flow resolution) from cached files - no download
 ##   step08: final numbers - strict Sen identity, 0 / 0.1 / 1 mm thresholds, dam-regulated gauges
 ##           sensitivity, effect sizes with 95% intervals, manuscript Tables 1-3, final figure numbering
+##   step09: serial dependence repeated for n = 30 and n = 120 (reviewer check: calibration of
+##           block permutation across record lengths); checkpointed per cell, earlier steps skipped
+##   step10: Figure 1 streamflow in SI units (m3/s) as required by JSCS; nothing is recomputed
 ## Author: Alper Umut Tosun (YTU Statistics) | seed 2026
 ############################################################################
 
@@ -1065,15 +1068,20 @@ cinfo <- if (exists("cases")) cases else rd("step03_case_studies.csv")
 cinfo$key <- paste(cinfo$id, cinfo$month)
 cinfo <- cinfo[match(keep, cinfo$key), ]
 fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", paste("=", formatC(p, format = "f", digits = 3)))
-unit_lab <- ifelse(cinfo$application == "USGS_streamflow", "mean flow, cfs", "total, mm")
+CFS2CMS <- 0.0283168                                         # 1 cubic foot per second = 0.0283168 m3/s (SI units)
+flow_case <- cinfo$application == "USGS_streamflow"         # which panels are streamflow
+unit_lab <- ifelse(flow_case, "mean flow, m\u00b3 s\u207b\u00b9", "total, mm")  # SI unit labels
+cinfo$sen_si <- cinfo$sen_slope * ifelse(flow_case, CFS2CMS, 1)   # Sen slope in the same units as the plot
 cinfo$panel <- paste0(LETTERS[1:3], ". ", tools::toTitleCase(tolower(sub(",.*| \\(.*", "", cinfo$name))), ", ",
                       month.name[cinfo$month], " (", unit_lab, ")")      # panel label
-cinfo$note <- paste0("MK p ", fmt_p(cinfo$p_MK_full), ";  Sen slope = ", signif(cinfo$sen_slope, 2),
+cinfo$note <- paste0("MK p ", fmt_p(cinfo$p_MK_full), ";  Sen slope = ", sapply(signif(cinfo$sen_si, 2), format, scientific = FALSE),
                      "\nTwo-part p ", fmt_p(cinfo$p_TwoPart), "  (occurrence ",
                      ifelse(cinfo$dir_occ > 0, "increasing", "decreasing"), ", amount ",
                      ifelse(cinfo$dir_amt > 0, "increasing", "decreasing"), ")")  # in-panel annotation
 cs$panel <- factor(cinfo$panel[match(cs$key, cinfo$key)], levels = cinfo$panel)
 cs$type <- ifelse(cs$value > 0, "Positive value", "Exact zero")
+is_flow <- cs$application == "USGS_streamflow"              # streamflow rows of the case series
+cs$value[is_flow] <- cs$value[is_flow] * CFS2CMS             # cfs -> m3/s (zeros stay zero)
 win <- lapply(cinfo$application, function(a) if (a == "USGS_streamflow") FLOW_YEARS else YEARS)  # analysis window per panel
 ann <- data.frame(panel = factor(cinfo$panel, levels = cinfo$panel), note = cinfo$note,
                   x = sapply(win, min) - 0.5,                # left edge of each panel's own window
@@ -1088,7 +1096,7 @@ gaps <- do.call(rbind, lapply(seq_along(win), function(i) {  # runs of years wit
 }))
 edges <- data.frame(panel = factor(cinfo$panel, levels = cinfo$panel),
                     x = c(sapply(win, min) - 0.5, sapply(win, max) + 0.5))  # x-range = analysis window
-plog <- scales::pseudo_log_trans(sigma = 1, base = 10)      # log-like for large values, linear near 0, keeps zeros
+plog <- scales::pseudo_log_trans(sigma = 0.001, base = 10)  # log-like above 0.001, linear near 0, keeps zeros (m3/s values are small)
 ann$y_note <- plog$inverse(plog$transform(ann$y) * 1.30)     # note position above the data (in plotted units)
 ann$y_top  <- plog$inverse(plog$transform(ann$y) * 1.34)     # head-room
 f1 <- ggplot(cs, aes(year, value)) +
@@ -1103,8 +1111,8 @@ f1 <- ggplot(cs, aes(year, value)) +
   geom_text(data = ann, aes(x = x, y = y_note, label = note), hjust = 0, vjust = 1,
             size = 2.5, colour = INK2, lineheight = 0.95) +
   facet_wrap(~ panel, ncol = 1, scales = "free") +
-  scale_y_continuous(trans = plog, breaks = c(0, 1, 10, 100, 1000, 10000),
-                     labels = c("0", "1", "10", "100", "1000", "10000"),
+  scale_y_continuous(trans = plog, breaks = c(0, 0.01, 0.1, 1, 10, 100, 1000),
+                     labels = c("0", "0.01", "0.1", "1", "10", "100", "1000"),
                      expand = expansion(mult = c(0.02, 0.05))) +
   geom_blank(data = ann, aes(x = x, y = y_top)) +             # head-room so the note sits above the data
   scale_x_continuous(expand = expansion(add = 0.5)) +
@@ -1454,3 +1462,92 @@ write.csv(t3, file.path(tab_dir, "table3_real.csv"), row.names = FALSE)
 
 print(t3, row.names = FALSE); print(eff_sum, row.names = FALSE)
 message("step08 outputs written to: ", out_dir, " and ", tab_dir)
+
+############################################################################
+## ===========================  STEP 09  ===================================
+## Serial dependence at other record lengths (n = 30 and n = 120).
+## Same generator, dependence levels, shapes, scenarios and zero shares as step04 (n = 64),
+## so the three lengths can be compared directly. Each cell is saved as soon as it finishes:
+## if R is stopped, the next run continues from the first unfinished cell.
+############################################################################
+N9 <- c(30, 120)                                             # new record lengths (n = 64 is step04)
+grid9 <- expand.grid(scen = SCEN4, p0 = P04, dep = DEP$dep, shape = SHAPES4, n = N9,
+                     stringsAsFactors = FALSE)               # 2 x 2 x 3 x 2 x 4 = 96 cells
+grid9 <- merge(grid9, DEP, by = "dep")                       # add rhoI and rhoA
+grid9 <- grid9[order(grid9$n, grid9$shape, grid9$dep, grid9$scen, grid9$p0), ]  # fixed cell order
+grid9$cell <- seq_len(nrow(grid9))                           # cell number = checkpoint name
+cache9_dir <- file.path(out_dir, "cache_step09"); dir.create(cache9_dir, showWarnings = FALSE)  # checkpoint folder
+
+run_cell9 <- function(k, grid, cache_dir) {                  # one cell: R4 series, all tests
+  f <- file.path(cache_dir, sprintf("cell_%03d.rds", k))     # checkpoint file of this cell
+  if (file.exists(f)) return(readRDS(f))                     # already done -> read it
+  g <- grid[k, ]; set.seed(9000 + k)                         # cell-specific seed (reproducible)
+  eff <- scen_eff[[g$scen]]                                  # trend effects of the scenario
+  res <- t(replicate(R4, dep_stats(gen_dep(g$n, g$p0, eff[1], eff[2], g$rhoI, g$rhoA, g$shape))))  # simulate + test
+  res <- cbind(cell = k, res); saveRDS(res, f); res          # save checkpoint and return
+}
+
+raw9_file <- file.path(out_dir, "step09_raw.rds")            # final step09 cache
+if (file.exists(raw9_file)) {                                # everything already computed
+  raw9 <- readRDS(raw9_file); message("step09_raw.rds found - simulation skipped.")
+} else {
+  t0 <- Sys.time()                                           # start clock
+  todo <- sum(!file.exists(file.path(cache9_dir, sprintf("cell_%03d.rds", grid9$cell))))  # unfinished cells
+  message("step09: ", todo, " of ", nrow(grid9), " cells to compute.")
+  cl <- makeCluster(max(1, detectCores() - 1))               # one worker per core, one core left free
+  clusterExport(cl, c("gen_dep", "S_stat", "mk_asym", "mk_hr", "sen_slope", "p_amt_exact", "p_occ_exact",
+                      "p_fisher", "fisher_stat", "block_perm_p", "dep_stats", "scen_eff", "KEND",
+                      "R4", "B4", "MU0"))                    # functions and constants the workers need
+  ord <- grid9$cell[order(-grid9$n)]                         # long series first (better load balance)
+  raw9 <- as.data.frame(do.call(rbind, parLapplyLB(cl, ord, run_cell9, grid = grid9, cache_dir = cache9_dir)))
+  stopCluster(cl)                                            # close workers
+  raw9 <- merge(grid9, raw9, by = "cell"); saveRDS(raw9, raw9_file)  # attach cell settings and save
+  message("step09 run time: ", round(difftime(Sys.time(), t0, units = "mins"), 1), " min")
+}
+
+## ---- 43. step09 tables: rejection rates for n = 30, 64, 120 ----------------------------------------
+rej9 <- do.call(rbind, lapply(split(raw9, raw9$cell), function(d) {
+  r <- sapply(tests4, function(v) mean(d[[v]] < 0.05, na.rm = TRUE))  # rejection rate at 5 %
+  data.frame(n = d$n[1], shape = d$shape[1], dep = d$dep[1], rhoI = d$rhoI[1], rhoA = d$rhoA[1],
+             scen = d$scen[1], p0 = d$p0[1], t(round(r, 3)),
+             mean_f_occ = round(mean(d$f_occ), 2), mean_f_amt = round(mean(d$f_amt), 2))
+}))
+rej64 <- rd("step04_rejection_rates.csv"); rej64 <- cbind(n = 64, rej64)  # n = 64 from step04 (same design)
+rejN <- rbind(rej9, rej64[, names(rej9)])                    # all three lengths in one table
+rejN <- rejN[order(rejN$n, rejN$shape, match(rejN$scen, SCEN4), rejN$rhoI, rejN$p0), ]
+write.csv(rejN, file.path(out_dir, "step09_dependence_by_n.csv"), row.names = FALSE)
+
+sizeN <- rejN[rejN$scen == "H0", ]                           # size only (no-trend cells)
+size_rng <- aggregate(cbind(TwoPart_naive, TwoPart_HR, TwoPart_BlockPerm, MK_full, MK_full_BlockPerm) ~ n + dep,
+                      sizeN, function(x) paste0(min(x), "-", max(x)))  # range over shapes and zero shares
+write.csv(size_rng, file.path(out_dir, "step09_size_ranges.csv"), row.names = FALSE)
+print(size_rng, row.names = FALSE)                           # quick look in the console
+
+## ---- 44. Figure A6: size under dependence for n = 30, 64, 120 ----------------------------------------
+library(ggplot2)                                             # (already loaded by step06)
+fig_dir <- file.path(out_dir, "figures"); dir.create(fig_dir, showWarnings = FALSE)
+vlab9 <- c(MK_full = "MK full series|Naive", MK_full_HR = "MK full series|Hamed-Rao",
+           MK_full_BlockPerm = "MK full series|Block permutation", TwoPart_naive = "Two-part (proposed)|Naive",
+           TwoPart_HR = "Two-part (proposed)|Hamed-Rao", TwoPart_BlockPerm = "Two-part (proposed)|Block permutation")
+s9 <- sizeN[sizeN$p0 == 0.3, ]                               # share of zeros 0.3 (as main-text Fig. 4)
+l9 <- do.call(rbind, lapply(names(vlab9), function(m) {      # long format: one row per test version
+  s <- strsplit(vlab9[[m]], "\\|")[[1]]
+  data.frame(n = s9$n, shape = s9$shape, dep = s9$dep, family = s[1], version = s[2], rate = s9[[m]])
+}))
+l9$dep <- factor(l9$dep, levels = c("none", "moderate", "strong"))
+l9$family <- factor(l9$family, levels = c("Two-part (proposed)", "MK full series"))
+l9$version <- factor(l9$version, levels = c("Naive", "Hamed-Rao", "Block permutation"))
+l9$n <- factor(paste0("n = ", l9$n), levels = paste0("n = ", c(30, 64, 120)))
+l9$shape <- factor(ifelse(l9$shape == 0.8, "Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"),
+                   levels = c("Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"))
+fA6 <- ggplot(l9, aes(dep, rate, colour = family, linetype = version, shape = version,
+                      group = interaction(family, version))) +
+  geom_hline(yintercept = 0.05, colour = MUTED, linewidth = 0.4) +   # nominal 5 % level
+  geom_line(linewidth = 0.5) + geom_point(size = 1.6) +
+  scale_colour_manual(values = COL_M[c("Two-part (proposed)", "MK full series")]) +
+  scale_linetype_manual(values = c("solid", "42", "11")) + scale_shape_manual(values = c(16, 17, 15)) +
+  facet_grid(shape ~ n) +                                    # rows: amount shape, columns: record length
+  labs(x = "Serial dependence", y = "Rejection rate under no trend (5% level)") + theme_zi()
+save_fig(fA6, "figA6_dependence_size_by_n", 6.5, 4.6)        # appendix Figure A6
+
+message("step09 outputs written to: ", out_dir)
