@@ -1037,11 +1037,15 @@ theme_zi <- function() {
           panel.spacing.x = unit(0.9, "lines"))
 }
 
+SUB_NAME <- c(fig1_case_series = "Fig1", fig2_sen_collapse = "Fig2", fig3_power = "Fig3",
+              fig4_dependence = "Fig4", fig5_real_pvalues = "Fig5", figA1_are = "FigS1",
+              figA3_power_n30 = "FigS2", figA4_power_n120 = "FigS3", figA2_betaE = "FigS4",
+              figA5_dependence_p06 = "FigS5", figA6_dependence_size_by_n = "FigS6")   # journal file names
 save_fig <- function(p, name, w, h) {
   ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, units = "in", device = cairo_pdf)
-  ggsave(file.path(fig_dir, paste0(name, ".tif")), p, width = w, height = h, units = "in", dpi = 1600,
+  ggsave(file.path(fig_dir, paste0(SUB_NAME[[name]], ".tif")), p, width = w, height = h, units = "in", dpi = 1600,
          device = "tiff", compression = "lzw")
-  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 1600)
+  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 600)
   message("saved: ", name)
 }
 rd <- function(f) read.csv(file.path(out_dir, f), stringsAsFactors = FALSE)
@@ -1067,7 +1071,7 @@ nice_name <- function(x) {
   x <- gsub("\\b(Nr|Near)\\b", "near", x)
   x
 }
-cinfo$panel <- paste0(LETTERS[1:3], ". ", nice_name(cinfo$name), ", ",
+cinfo$panel <- paste0("(", letters[1:3], ") ", nice_name(cinfo$name), ", ",
                       month.name[cinfo$month], " (", unit_lab, ")")
 cinfo$note <- paste0("MK p ", fmt_p(cinfo$p_MK_full), ";  Sen slope = ", sapply(signif(cinfo$sen_si, 2), format, scientific = FALSE),
                      "\nTwo-part p ", fmt_p(cinfo$p_TwoPart), "  (occurrence ",
@@ -1113,7 +1117,7 @@ f1 <- ggplot(cs, aes(year, value)) +
   scale_x_continuous(expand = expansion(add = 0.5)) +
   guides(fill = guide_legend(override.aes = list(colour = "#c3c2b7"))) +
   labs(x = "Year", y = "Monthly value (pseudo-log scale)") + theme_zi()
-save_fig(f1, "fig1_case_series", 7, 6.5)
+save_fig(f1, "fig1_case_series", 6.85, 6.5)
 }
 
 ## ---- Figure 2: share of zero Sen slopes -------------------------------------
@@ -1126,7 +1130,7 @@ f2 <- ggplot(r1, aes(p0, Sen_zero_share, colour = n, shape = n)) +
   facet_wrap(~ scen, nrow = 1) +
   scale_x_continuous(breaks = c(0.3, 0.5, 0.65, 0.8), labels = c("0.3", "0.5", "0.65", "0.8")) + scale_y_continuous(limits = c(0, 1)) +
   labs(x = "Share of zeros", y = "Share of samples with Sen slope = 0") + theme_zi()
-save_fig(f2, "fig2_sen_collapse", 7, 2.9)
+save_fig(f2, "fig2_sen_collapse", 6.85, 2.9)
 
 ## ---- Figure A1: efficiency of MK on the full series -------------------------
 pz <- seq(0, 0.95, by = 0.01)
@@ -1166,9 +1170,9 @@ power_fig <- function(nn) {
     labs(x = "Share of zeros", y = "Size-adjusted power (5% level)") + theme_zi() +
     guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
 }
-save_fig(power_fig(64), "fig3_power", 7, 4.6)
-save_fig(power_fig(30), "figA3_power_n30", 7, 4.6)
-save_fig(power_fig(120), "figA4_power_n120", 7, 4.6)
+save_fig(power_fig(64), "fig3_power", 6.85, 4.6)
+save_fig(power_fig(30), "figA3_power_n30", 6.85, 4.6)
+save_fig(power_fig(120), "figA4_power_n120", 6.85, 4.6)
 
 ## ---- Figure A2: bias of beta_E estimators -----------------------------------
 COL_E <- c("Two-part plug-in" = "#2a78d6", "Sen's slope" = "#eb6834", "ATS slope" = "#1baf7a",
@@ -1208,17 +1212,19 @@ l4$scen <- factor(SCEN_LAB[l4$scen], levels = SCEN_LAB[c("H0", "occ", "amt", "op
 l4$shape <- factor(ifelse(l4$shape == 0.8, "Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"),
                    levels = c("Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"))
 ref <- data.frame(scen = factor(SCEN_LAB["H0"], levels = levels(l4$scen)), y = 0.05)
-ggplot(l4, aes(dep, rate, colour = family, linetype = version, shape = version,
+ggplot(l4, aes(dep, rate, colour = family, linetype = version, shape = interaction(version, family),
                      group = interaction(family, version))) +
   geom_hline(data = ref, aes(yintercept = y), colour = MUTED, linewidth = 0.4) +
   geom_line(linewidth = 0.5) + geom_point(size = 1.6) +
   scale_colour_manual(values = COL_M[c("Two-part (proposed)", "MK full series")]) +
-  scale_linetype_manual(values = c("solid", "42", "11")) + scale_shape_manual(values = c(16, 17, 15)) +
+  scale_linetype_manual(values = c("solid", "42", "11")) +
+  scale_shape_manual(values = c(16, 17, 15, 1, 2, 0), guide = "none") +   # filled: two-part; open: MK
+  guides(colour = guide_legend(override.aes = list(shape = c(16, 1), linetype = "solid"))) +
   facet_grid(shape ~ scen) +
   labs(x = "Serial dependence", y = "Rejection rate (5% level)") + theme_zi()
 }
-save_fig(dep_fig(0.3), "fig4_dependence", 7, 4.6)
-save_fig(dep_fig(0.6), "figA5_dependence_p06", 7, 4.6)
+save_fig(dep_fig(0.3), "fig4_dependence", 6.85, 4.6)
+save_fig(dep_fig(0.6), "figA5_dependence_p06", 6.85, 4.6)
 
 ## ---- Figure 5: MK versus two-part p-values ----------------------------------
 rr <- if (exists("real5")) real5 else rd("step05_real_robust_series.csv")
@@ -1245,7 +1251,7 @@ f7 <- ggplot(rr, aes(x, y)) +
   facet_wrap(~ app, nrow = 1) + coord_equal(xlim = c(0, cap), ylim = c(0, cap)) +
   labs(x = expression(-log[10] * " p  (MK, full series)"), y = expression(-log[10] * " p  (two-part test)")) +
   theme_zi() + guides(colour = guide_legend(nrow = 2), shape = guide_legend(nrow = 2))
-save_fig(f7, "fig5_real_pvalues", 7, 4.4)
+save_fig(f7, "fig5_real_pvalues", 6.85, 4.4)
 
 message("figures written to: ", fig_dir)
 
@@ -1529,12 +1535,14 @@ l9$version <- factor(l9$version, levels = c("Naive", "Hamed-Rao", "Block permuta
 l9$n <- factor(paste0("n = ", l9$n), levels = paste0("n = ", c(30, 64, 120)))
 l9$shape <- factor(ifelse(l9$shape == 0.8, "Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"),
                    levels = c("Shape 0.8\n(precipitation-like)", "Shape 0.25\n(streamflow-like)"))
-fA6 <- ggplot(l9, aes(dep, rate, colour = family, linetype = version, shape = version,
+fA6 <- ggplot(l9, aes(dep, rate, colour = family, linetype = version, shape = interaction(version, family),
                       group = interaction(family, version))) +
   geom_hline(yintercept = 0.05, colour = MUTED, linewidth = 0.4) +
   geom_line(linewidth = 0.5) + geom_point(size = 1.6) +
   scale_colour_manual(values = COL_M[c("Two-part (proposed)", "MK full series")]) +
-  scale_linetype_manual(values = c("solid", "42", "11")) + scale_shape_manual(values = c(16, 17, 15)) +
+  scale_linetype_manual(values = c("solid", "42", "11")) +
+  scale_shape_manual(values = c(16, 17, 15, 1, 2, 0), guide = "none") +   # filled: two-part; open: MK
+  guides(colour = guide_legend(override.aes = list(shape = c(16, 1), linetype = "solid"))) +
   facet_grid(shape ~ n) +
   labs(x = "Serial dependence", y = "Rejection rate under no trend (5% level)") + theme_zi()
 save_fig(fA6, "figA6_dependence_size_by_n", 6.5, 4.6)
