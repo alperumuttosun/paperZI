@@ -23,8 +23,14 @@
 rm(list = ls())
 
 ## ---- Setup: folders and packages --------------------------------------------
-PROJECT_DIR <- getwd()                  # folder that holds (or will hold) paperZI/
+home <- Sys.getenv("USERPROFILE", unset = path.expand("~"))
+candidates <- c(getwd(), file.path(home, "Desktop", "cru130"),
+                file.path(home, "OneDrive", "Desktop", "cru130"))   # folders searched for an existing paperZI/
+found <- candidates[dir.exists(file.path(candidates, "paperZI"))]
+PROJECT_DIR <- if (length(found)) found[1] else getwd()
+setwd(PROJECT_DIR)
 out_dir <- file.path(PROJECT_DIR, "paperZI")
+message("project folder: ", PROJECT_DIR)
 if (!dir.exists(out_dir) && interactive()) {
   ans <- readline(paste0("No paperZI/ folder in ", PROJECT_DIR, ". All simulations and downloads will run ",
                          "from scratch (many hours). Continue? [y/n] "))
@@ -1033,9 +1039,9 @@ theme_zi <- function() {
 
 save_fig <- function(p, name, w, h) {
   ggsave(file.path(fig_dir, paste0(name, ".pdf")), p, width = w, height = h, units = "in", device = cairo_pdf)
-  ggsave(file.path(fig_dir, paste0(name, ".tif")), p, width = w, height = h, units = "in", dpi = 600,
+  ggsave(file.path(fig_dir, paste0(name, ".tif")), p, width = w, height = h, units = "in", dpi = 1600,
          device = "tiff", compression = "lzw")
-  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 600)
+  ggsave(file.path(fig_dir, paste0(name, ".png")), p, width = w, height = h, units = "in", dpi = 1600)
   message("saved: ", name)
 }
 rd <- function(f) read.csv(file.path(out_dir, f), stringsAsFactors = FALSE)
